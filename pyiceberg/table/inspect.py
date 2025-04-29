@@ -581,55 +581,59 @@ class InspectTable:
         snapshot = self._get_snapshot(snapshot_id)
 
         io = self.tbl.io
-        for manifest_list in snapshot.manifests(io):
-            for manifest_entry in manifest_list.fetch_manifest_entry(io):
-                data_file = manifest_entry.data_file
-                if data_file_filter and data_file.content not in data_file_filter:
-                    continue
-                column_sizes = data_file.column_sizes or {}
-                value_counts = data_file.value_counts or {}
-                null_value_counts = data_file.null_value_counts or {}
-                nan_value_counts = data_file.nan_value_counts or {}
-                lower_bounds = data_file.lower_bounds or {}
-                upper_bounds = data_file.upper_bounds or {}
-                readable_metrics = {
-                    schema.find_column_name(field.field_id): {
-                        "column_size": column_sizes.get(field.field_id),
-                        "value_count": value_counts.get(field.field_id),
-                        "null_value_count": null_value_counts.get(field.field_id),
-                        "nan_value_count": nan_value_counts.get(field.field_id),
-                        "lower_bound": from_bytes(field.field_type, lower_bound)
-                        if (lower_bound := lower_bounds.get(field.field_id))
-                        else None,
-                        "upper_bound": from_bytes(field.field_type, upper_bound)
-                        if (upper_bound := upper_bounds.get(field.field_id))
-                        else None,
-                    }
-                    for field in self.tbl.metadata.schema().fields
+
+        def process_manifest_entry(manifest_entry):
+            data_file = manifest_entry.data_file
+            if data_file_filter and data_file.content not in data_file_filter:
+                return None
+            column_sizes = data_file.column_sizes or {}
+            value_counts = data_file.value_counts or {}
+            null_value_counts = data_file.null_value_counts or {}
+            nan_value_counts = data_file.nan_value_counts or {}
+            lower_bounds = data_file.lower_bounds or {}
+            upper_bounds = data_file.upper_bounds or {}
+            readable_metrics = {
+                schema.find_column_name(field.field_id): {
+                    "column_size": column_sizes.get(field.field_id),
+                    "value_count": value_counts.get(field.field_id),
+                    "null_value_count": null_value_counts.get(field.field_id),
+                    "nan_value_count": nan_value_counts.get(field.field_id),
+                    "lower_bound": from_bytes(field.field_type, lower_bound)
+                    if (lower_bound := lower_bounds.get(field.field_id))
+                    else None,
+                    "upper_bound": from_bytes(field.field_type, upper_bound)
+                    if (upper_bound := upper_bounds.get(field.field_id))
+                    else None,
                 }
-                files.append(
-                    {
-                        "content": data_file.content,
-                        "file_path": data_file.file_path,
-                        "file_format": data_file.file_format,
-                        "spec_id": data_file.spec_id,
-                        "record_count": data_file.record_count,
-                        "file_size_in_bytes": data_file.file_size_in_bytes,
-                        "column_sizes": dict(data_file.column_sizes) if data_file.column_sizes is not None else None,
-                        "value_counts": dict(data_file.value_counts) if data_file.value_counts is not None else None,
-                        "null_value_counts": dict(data_file.null_value_counts)
-                        if data_file.null_value_counts is not None
-                        else None,
-                        "nan_value_counts": dict(data_file.nan_value_counts) if data_file.nan_value_counts is not None else None,
-                        "lower_bounds": dict(data_file.lower_bounds) if data_file.lower_bounds is not None else None,
-                        "upper_bounds": dict(data_file.upper_bounds) if data_file.upper_bounds is not None else None,
-                        "key_metadata": data_file.key_metadata,
-                        "split_offsets": data_file.split_offsets,
-                        "equality_ids": data_file.equality_ids,
-                        "sort_order_id": data_file.sort_order_id,
-                        "readable_metrics": readable_metrics,
-                    }
-                )
+                for field in self.tbl.metadata.schema().fields
+            }
+            return {
+                "content": data_file.content,
+                "file_path": data_file.file_path,
+                "file_format": data_file.file_format,
+                "spec_id": data_file.spec_id,
+                "record_count": data_file.record_count,
+                "file_size_in_bytes": data_file.file_size_in_bytes,
+                "column_sizes": dict(data_file.column_sizes) if data_file.column_sizes is not None else None,
+                "value_counts": dict(data_file.value_counts) if data_file.value_counts is not None else None,
+                "null_value_counts": dict(data_file.null_value_counts)
+                if data_file.null_value_counts is not None
+                else None,
+                "nan_value_counts": dict(data_file.nan_value_counts) if data_file.nan_value_counts is not None else None,
+                "lower_bounds": dict(data_file.lower_bounds) if data_file.lower_bounds is not None else None,
+                "upper_bounds": dict(data_file.upper_bounds) if data_file.upper_bounds is not None else None,
+                "key_metadata": data_file.key_metadata,
+                "split_offsets": data_file.split_offsets,
+                "equality_ids": data_file.equality_ids,
+                "sort_order_id": data_file.sort_order_id,
+                "readable_metrics": readable_metrics,
+            }
+
+        executor = ExecutorFactory.get_or_create()
+        for manifest_list in snapshot.manifests(io):
+            manifest_entries = manifest_list.fetch_manifest_entry(io)
+            results = executor.map(process_manifest_entry, manifest_entries)
+            files.extend(filter(None, results))
 
         return pa.Table.from_pylist(
             files,
