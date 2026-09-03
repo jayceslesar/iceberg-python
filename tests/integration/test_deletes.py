@@ -15,8 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint:disable=redefined-outer-name
+from collections.abc import Generator
 from datetime import datetime
-from typing import Generator, List
 
 import pyarrow as pa
 import pytest
@@ -25,16 +25,18 @@ from pyspark.sql import SparkSession
 from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.expressions import AlwaysTrue, EqualTo, LessThanOrEqual
-from pyiceberg.manifest import ManifestEntryStatus
+from pyiceberg.manifest import ManifestContent, ManifestEntryStatus
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import Table
+from pyiceberg.table.deletion_vector import deletion_vectors_from_puffin_file
+from pyiceberg.table.puffin import PuffinFile
 from pyiceberg.table.snapshots import Operation, Summary
 from pyiceberg.transforms import IdentityTransform
 from pyiceberg.types import FloatType, IntegerType, LongType, NestedField, StringType, TimestampType
 
 
-def run_spark_commands(spark: SparkSession, sqls: List[str]) -> None:
+def run_spark_commands(spark: SparkSession, sqls: list[str]) -> None:
     for sql in sqls:
         spark.sql(sql)
 
@@ -975,3 +977,115 @@ def test_manifest_entry_after_deletes(session_catalog: RestCatalog) -> None:
     assert after_delete_snapshot is not None
 
     assert_manifest_entry(ManifestEntryStatus.DELETED, after_delete_snapshot.snapshot_id)
+
+
+@pytest.mark.integration
+def test_manifest_entry_snapshot_id_after_partial_deletes(session_catalog: RestCatalog) -> None:
+    identifier = "default.test_manifest_entry_snapshot_id_after_partial_deletes"
+    try:
+        session_catalog.drop_table(identifier)
+    except NoSuchTableError:
+        pass
+
+    schema = pa.schema(
+        [
+            ("id", pa.int32()),
+            ("name", pa.string()),
+        ]
+    )
+
+    table = session_catalog.create_table(identifier, schema)
+    data = pa.Table.from_pylist(
+        [
+            {"id": 1, "name": "keep"},
+            {"id": 2, "name": "keep"},
+            {"id": 3, "name": "delete_me"},
+            {"id": 4, "name": "delete_me"},
+        ],
+        schema=schema,
+    )
+    table.append(data)
+
+    # Partial delete: only some rows match, triggering CoW overwrite via _OverwriteFiles
+    table.delete(EqualTo("name", "delete_me"))
+    after_delete_snapshot = table.refresh().current_snapshot()
+    assert after_delete_snapshot is not None
+
+    manifests = after_delete_snapshot.manifests(table.io)
+    deleted_entries = [
+        entry
+        for manifest in manifests
+        for entry in manifest.fetch_manifest_entry(table.io, discard_deleted=False)
+        if entry.status == ManifestEntryStatus.DELETED
+    ]
+
+    assert len(deleted_entries) > 0, "Expected at least one DELETED manifest entry from the CoW overwrite"
+
+    for entry in deleted_entries:
+        assert entry.snapshot_id == after_delete_snapshot.snapshot_id, (
+            f"DELETED entry snapshot_id should be {after_delete_snapshot.snapshot_id} "
+            f"(the deleting snapshot), but was {entry.snapshot_id}"
+        )
+
+
+@pytest.mark.integration
+def test_read_spark_written_puffin_dv(spark: SparkSession, session_catalog: RestCatalog) -> None:
+    """Verify pyiceberg can read Puffin DVs written by Spark."""
+    identifier = "default.spark_puffin_format_test"
+
+    spark.sql(f"DROP TABLE IF EXISTS {identifier}")
+    spark.sql(
+        f"""
+        CREATE TABLE {identifier} (id BIGINT)
+        USING iceberg
+        TBLPROPERTIES (
+            'format-version' = '3',
+            'write.delete.mode' = 'merge-on-read'
+        )
+        """
+    )
+
+    df = spark.range(1, 51)
+    df.coalesce(1).writeTo(identifier).append()
+
+    files_before = spark.sql(f"SELECT * FROM {identifier}.files").collect()
+    assert len(files_before) == 1, f"Expected 1 file, got {len(files_before)}"
+
+    spark.sql(f"DELETE FROM {identifier} WHERE id IN (10, 20, 30, 40)")
+
+    table = session_catalog.load_table(identifier)
+    current_snapshot = table.current_snapshot()
+    assert current_snapshot is not None
+
+    manifests = current_snapshot.manifests(table.io)
+    delete_manifests = [m for m in manifests if m.content == ManifestContent.DELETES]
+    assert len(delete_manifests) == 1, "Expected exactly one delete manifest with DVs"
+
+    delete_manifest = delete_manifests[0]
+    entries = list(delete_manifest.fetch_manifest_entry(table.io))
+    assert len(entries) == 1, "Expected exactly one delete file entry"
+
+    delete_entry = entries[0]
+    puffin_path = delete_entry.data_file.file_path
+    assert puffin_path.endswith(".puffin"), f"Expected Puffin file, got: {puffin_path}"
+
+    input_file = table.io.new_input(puffin_path)
+    with input_file.open() as f:
+        puffin_bytes = f.read()
+
+    puffin = PuffinFile(puffin_bytes)
+
+    assert len(puffin.footer.blobs) == 1, "Expected exactly one blob"
+
+    blob = puffin.footer.blobs[0]
+    assert blob.type == "deletion-vector-v1"
+    assert "referenced-data-file" in blob.properties
+    assert blob.properties["cardinality"] == "4"
+
+    dvs = deletion_vectors_from_puffin_file(puffin)
+    assert len(dvs) == 1, "Expected one data file's deletions"
+
+    for dv in dvs:
+        positions = dv.to_vector().to_pylist()
+        assert len(positions) == 4, f"Expected 4 deleted positions, got {len(positions)}"
+        assert sorted(positions) == [9, 19, 29, 39], f"Unexpected positions: {positions}"

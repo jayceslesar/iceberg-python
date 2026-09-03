@@ -16,12 +16,14 @@
 # under the License.
 from __future__ import annotations
 
+import itertools
+from collections.abc import Iterator
 from datetime import datetime, timezone
-from functools import reduce
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any
 
 from pyiceberg.conversions import from_bytes
-from pyiceberg.manifest import DataFileContent, ManifestContent, ManifestFile, PartitionFieldSummary
+from pyiceberg.expressions import AlwaysTrue, BooleanExpression
+from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestFile, PartitionFieldSummary
 from pyiceberg.partitioning import PartitionSpec
 from pyiceberg.table.snapshots import Snapshot, ancestors_of
 from pyiceberg.types import PrimitiveType
@@ -33,11 +35,38 @@ if TYPE_CHECKING:
 
     from pyiceberg.table import Table
 
+ALWAYS_TRUE = AlwaysTrue()
+
+
+def _readable_bound(field_type: PrimitiveType, bound: bytes | None) -> Any | None:
+    return from_bytes(field_type, bound) if bound is not None else None
+
 
 class InspectTable:
+    """Provides metadata inspection for Apache Iceberg tables.
+
+    Exposes table metadata (snapshots, manifests, partitions, files,
+    schema history) as PyArrow Tables, mirroring the metadata tables
+    available in the Java Iceberg implementation.
+
+    Args:
+        tbl: The Iceberg table to inspect.
+
+    Raises:
+        ModuleNotFoundError: If PyArrow is not installed.
+    """
+
     tbl: Table
 
     def __init__(self, tbl: Table) -> None:
+        """Initialize InspectTable with the given Iceberg table.
+
+        Args:
+            tbl: The Iceberg table instance to inspect.
+
+        Raises:
+            ModuleNotFoundError: If PyArrow is not installed.
+        """
         self.tbl = tbl
 
         try:
@@ -45,7 +74,20 @@ class InspectTable:
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError("For metadata operations PyArrow needs to be installed") from e
 
-    def _get_snapshot(self, snapshot_id: Optional[int] = None) -> Snapshot:
+    def _get_snapshot(self, snapshot_id: int | None = None) -> Snapshot:
+        """Retrieve a snapshot by ID, or return the current snapshot.
+
+        Args:
+            snapshot_id: The snapshot ID to look up. If None, the current
+                snapshot is returned.
+
+        Returns:
+            The requested Snapshot.
+
+        Raises:
+            ValueError: If the snapshot ID is not found, or if no current
+                snapshot exists when snapshot_id is None.
+        """
         if snapshot_id is not None:
             if snapshot := self.tbl.metadata.snapshot_by_id(snapshot_id):
                 return snapshot
@@ -57,7 +99,19 @@ class InspectTable:
         else:
             raise ValueError("Cannot get a snapshot as the table does not have any.")
 
-    def snapshots(self) -> "pa.Table":
+    def _get_snapshots_by_id(self) -> dict[int, Snapshot]:
+        """Index the snapshots by ID."""
+        return {snapshot.snapshot_id: snapshot for snapshot in self.tbl.metadata.snapshots}
+
+    def snapshots(self) -> pa.Table:
+        """Return all snapshots of the table as a PyArrow Table.
+
+        Returns:
+            pa.Table: A table with columns: ``committed_at`` (timestamp[ms]),
+                ``snapshot_id`` (int64), ``parent_id`` (int64, nullable),
+                ``operation`` (string, nullable), ``manifest_list`` (string),
+                and ``summary`` (map<string, string>, nullable).
+        """
         import pyarrow as pa
 
         snapshots_schema = pa.schema(
@@ -95,7 +149,24 @@ class InspectTable:
             schema=snapshots_schema,
         )
 
-    def entries(self, snapshot_id: Optional[int] = None) -> "pa.Table":
+    def entries(self, snapshot_id: int | None = None) -> pa.Table:
+        """Return all manifest entries for a snapshot as a PyArrow Table.
+
+        Each row is one manifest entry (data or delete file), including
+        raw and human-readable column-level statistics.
+
+        Args:
+            snapshot_id: The snapshot to inspect. Defaults to the current snapshot.
+
+        Returns:
+            pa.Table: A table with columns: ``status``, ``snapshot_id``,
+                ``sequence_number``, ``file_sequence_number``, ``data_file``
+                (struct), and ``readable_metrics`` (struct).
+
+        Raises:
+            ValueError: If the specified snapshot does not exist, or if the
+                table has no snapshots and snapshot_id is None.
+        """
         import pyarrow as pa
 
         from pyiceberg.io.pyarrow import schema_to_pyarrow
@@ -176,12 +247,8 @@ class InspectTable:
                         "null_value_count": null_value_counts.get(field.field_id),
                         "nan_value_count": nan_value_counts.get(field.field_id),
                         # Makes them readable
-                        "lower_bound": from_bytes(field.field_type, lower_bound)
-                        if (lower_bound := lower_bounds.get(field.field_id))
-                        else None,
-                        "upper_bound": from_bytes(field.field_type, upper_bound)
-                        if (upper_bound := upper_bounds.get(field.field_id))
-                        else None,
+                        "lower_bound": _readable_bound(field.field_type, lower_bounds.get(field.field_id)),
+                        "upper_bound": _readable_bound(field.field_type, upper_bounds.get(field.field_id)),
                     }
                     for field in self.tbl.metadata.schema().fields
                 }
@@ -226,7 +293,16 @@ class InspectTable:
             schema=entries_schema,
         )
 
-    def refs(self) -> "pa.Table":
+    def refs(self) -> pa.Table:
+        """Return all snapshot references (branches and tags) as a PyArrow Table.
+
+        Returns:
+            pa.Table: A table with columns: ``name`` (string), ``type``
+                (dictionary<int32, string>), ``snapshot_id`` (int64),
+                ``max_reference_age_in_ms`` (int64, nullable),
+                ``min_snapshots_to_keep`` (int32, nullable), and
+                ``max_snapshot_age_in_ms`` (int64, nullable).
+        """
         import pyarrow as pa
 
         ref_schema = pa.schema(
@@ -256,10 +332,41 @@ class InspectTable:
 
         return pa.Table.from_pylist(ref_results, schema=ref_schema)
 
-    def partitions(self, snapshot_id: Optional[int] = None) -> "pa.Table":
+    def partitions(
+        self,
+        snapshot_id: int | None = None,
+        row_filter: str | BooleanExpression = ALWAYS_TRUE,
+        case_sensitive: bool = True,
+    ) -> pa.Table:
+        """Return partition-level statistics for a snapshot as a PyArrow Table.
+
+        Each row represents a unique partition and aggregates statistics
+        across all data and delete files in that partition. For unpartitioned
+        tables, a single row covers the whole table.
+
+        Args:
+            snapshot_id: The snapshot to inspect. Defaults to the current snapshot.
+            row_filter: A filter to limit which partitions are included.
+                Accepts a SQL-style string or a ``BooleanExpression``.
+            case_sensitive: Whether column name matching is case-sensitive.
+
+        Returns:
+            pa.Table: A table with columns: ``partition`` (struct, for
+                partitioned tables), ``spec_id`` (int32, for partitioned
+                tables), ``record_count``,
+                ``file_count``, ``total_data_file_size_in_bytes``,
+                ``position_delete_record_count``, ``position_delete_file_count``,
+                ``equality_delete_record_count``, ``equality_delete_file_count``,
+                ``last_updated_at``, and ``last_updated_snapshot_id``.
+
+        Raises:
+            ValueError: If the specified snapshot does not exist, or if the
+                table has no snapshots and snapshot_id is None.
+        """
         import pyarrow as pa
 
         from pyiceberg.io.pyarrow import schema_to_pyarrow
+        from pyiceberg.table import DataScan
 
         table_schema = pa.schema(
             [
@@ -275,7 +382,9 @@ class InspectTable:
             ]
         )
 
-        partition_record = self.tbl.metadata.specs_struct()
+        snapshot = self._get_snapshot(snapshot_id)
+        spec_ids = {manifest.partition_spec_id for manifest in snapshot.manifests(self.tbl.io)}
+        partition_record = self.tbl.metadata.specs_struct(spec_ids=spec_ids)
         has_partitions = len(partition_record.fields) > 0
 
         if has_partitions:
@@ -289,88 +398,98 @@ class InspectTable:
 
             table_schema = pa.unify_schemas([partitions_schema, table_schema])
 
-        snapshot = self._get_snapshot(snapshot_id)
-        executor = ExecutorFactory.get_or_create()
-        local_partitions_maps = executor.map(self._process_manifest, snapshot.manifests(self.tbl.io))
+        scan = DataScan(
+            table_metadata=self.tbl.metadata,
+            io=self.tbl.io,
+            row_filter=row_filter,
+            case_sensitive=case_sensitive,
+            snapshot_id=snapshot.snapshot_id,
+        )
 
-        partitions_map: Dict[Tuple[str, Any], Any] = {}
-        for local_map in local_partitions_maps:
-            for partition_record_key, partition_row in local_map.items():
-                if partition_record_key not in partitions_map:
-                    partitions_map[partition_record_key] = partition_row
-                else:
-                    existing = partitions_map[partition_record_key]
-                    existing["record_count"] += partition_row["record_count"]
-                    existing["file_count"] += partition_row["file_count"]
-                    existing["total_data_file_size_in_bytes"] += partition_row["total_data_file_size_in_bytes"]
-                    existing["position_delete_record_count"] += partition_row["position_delete_record_count"]
-                    existing["position_delete_file_count"] += partition_row["position_delete_file_count"]
-                    existing["equality_delete_record_count"] += partition_row["equality_delete_record_count"]
-                    existing["equality_delete_file_count"] += partition_row["equality_delete_file_count"]
+        partitions_map: dict[tuple[str, Any], Any] = {}
+        snapshots_by_id = self._get_snapshots_by_id()
 
-                    if partition_row["last_updated_at"] and (
-                        not existing["last_updated_at"] or partition_row["last_updated_at"] > existing["last_updated_at"]
-                    ):
-                        existing["last_updated_at"] = partition_row["last_updated_at"]
-                        existing["last_updated_snapshot_id"] = partition_row["last_updated_snapshot_id"]
+        for entry in itertools.chain.from_iterable(scan._plan_manifest_entries()):
+            partition = entry.data_file.partition
+            partition_record_dict = {
+                field.name: partition[pos] for pos, field in enumerate(self.tbl.metadata.specs()[entry.data_file.spec_id].fields)
+            }
+            entry_snapshot = snapshots_by_id.get(entry.snapshot_id) if entry.snapshot_id is not None else None
+            self._update_partitions_map_from_manifest_entry(
+                partitions_map, entry.data_file, partition_record_dict, entry_snapshot
+            )
 
         return pa.Table.from_pylist(
             partitions_map.values(),
             schema=table_schema,
         )
 
-    def _process_manifest(self, manifest: ManifestFile) -> Dict[Tuple[str, Any], Any]:
-        partitions_map: Dict[Tuple[str, Any], Any] = {}
-        for entry in manifest.fetch_manifest_entry(io=self.tbl.io):
-            partition = entry.data_file.partition
-            partition_record_dict = {
-                field.name: partition[pos]
-                for pos, field in enumerate(self.tbl.metadata.specs()[manifest.partition_spec_id].fields)
+    def _update_partitions_map_from_manifest_entry(
+        self,
+        partitions_map: dict[tuple[str, Any], Any],
+        file: DataFile,
+        partition_record_dict: dict[str, Any],
+        snapshot: Snapshot | None,
+    ) -> None:
+        """Update the partition statistics map with data from a single manifest entry.
+
+        Initialises a new partition row if the key has not been seen, then
+        increments count and size statistics based on the file content type.
+
+        Args:
+            partitions_map: Mutable dict keyed by hashable partition values,
+                accumulating per-partition statistics.
+            file: The data file entry from the manifest.
+            partition_record_dict: Maps partition field names to their values.
+            snapshot: The owning snapshot, used to track last-updated timestamps.
+        """
+        partition_record_key = _convert_to_hashable_type(partition_record_dict)
+        if partition_record_key not in partitions_map:
+            partitions_map[partition_record_key] = {
+                "partition": partition_record_dict,
+                "spec_id": file.spec_id,
+                "record_count": 0,
+                "file_count": 0,
+                "total_data_file_size_in_bytes": 0,
+                "position_delete_record_count": 0,
+                "position_delete_file_count": 0,
+                "equality_delete_record_count": 0,
+                "equality_delete_file_count": 0,
+                "last_updated_at": snapshot.timestamp_ms if snapshot else None,
+                "last_updated_snapshot_id": snapshot.snapshot_id if snapshot else None,
             }
-            entry_snapshot = self.tbl.snapshot_by_id(entry.snapshot_id) if entry.snapshot_id is not None else None
 
-            partition_record_key = _convert_to_hashable_type(partition_record_dict)
-            if partition_record_key not in partitions_map:
-                partitions_map[partition_record_key] = {
-                    "partition": partition_record_dict,
-                    "spec_id": entry.data_file.spec_id,
-                    "record_count": 0,
-                    "file_count": 0,
-                    "total_data_file_size_in_bytes": 0,
-                    "position_delete_record_count": 0,
-                    "position_delete_file_count": 0,
-                    "equality_delete_record_count": 0,
-                    "equality_delete_file_count": 0,
-                    "last_updated_at": entry_snapshot.timestamp_ms if entry_snapshot else None,
-                    "last_updated_snapshot_id": entry_snapshot.snapshot_id if entry_snapshot else None,
-                }
+        partition_row = partitions_map[partition_record_key]
 
-            partition_row = partitions_map[partition_record_key]
+        if snapshot is not None:
+            if partition_row["last_updated_at"] is None or partition_row["last_updated_at"] < snapshot.timestamp_ms:
+                partition_row["last_updated_at"] = snapshot.timestamp_ms
+                partition_row["last_updated_snapshot_id"] = snapshot.snapshot_id
 
-            if entry_snapshot is not None:
-                if (
-                    partition_row["last_updated_at"] is None
-                    or partition_row["last_updated_snapshot_id"] < entry_snapshot.timestamp_ms
-                ):
-                    partition_row["last_updated_at"] = entry_snapshot.timestamp_ms
-                    partition_row["last_updated_snapshot_id"] = entry_snapshot.snapshot_id
+        if file.content == DataFileContent.DATA:
+            partition_row["record_count"] += file.record_count
+            partition_row["file_count"] += 1
+            partition_row["total_data_file_size_in_bytes"] += file.file_size_in_bytes
+        elif file.content == DataFileContent.POSITION_DELETES:
+            partition_row["position_delete_record_count"] += file.record_count
+            partition_row["position_delete_file_count"] += 1
+        elif file.content == DataFileContent.EQUALITY_DELETES:
+            partition_row["equality_delete_record_count"] += file.record_count
+            partition_row["equality_delete_file_count"] += 1
+        else:
+            raise ValueError(f"Unknown DataFileContent ({file.content})")
 
-            if entry.data_file.content == DataFileContent.DATA:
-                partition_row["record_count"] += entry.data_file.record_count
-                partition_row["file_count"] += 1
-                partition_row["total_data_file_size_in_bytes"] += entry.data_file.file_size_in_bytes
-            elif entry.data_file.content == DataFileContent.POSITION_DELETES:
-                partition_row["position_delete_record_count"] += entry.data_file.record_count
-                partition_row["position_delete_file_count"] += 1
-            elif entry.data_file.content == DataFileContent.EQUALITY_DELETES:
-                partition_row["equality_delete_record_count"] += entry.data_file.record_count
-                partition_row["equality_delete_file_count"] += 1
-            else:
-                raise ValueError(f"Unknown DataFileContent ({entry.data_file.content})")
+    def _get_manifests_schema(self) -> pa.Schema:
+        """Return the PyArrow schema for the manifests metadata table.
 
-        return partitions_map
-
-    def _get_manifests_schema(self) -> "pa.Schema":
+        Returns:
+            pa.Schema: Schema with fields: ``content``, ``path``, ``length``,
+                ``partition_spec_id``, ``added_snapshot_id``,
+                ``added_data_files_count``, ``existing_data_files_count``,
+                ``deleted_data_files_count``, ``added_delete_files_count``,
+                ``existing_delete_files_count``, ``deleted_delete_files_count``,
+                and ``partition_summaries``.
+        """
         import pyarrow as pa
 
         partition_summary_schema = pa.struct(
@@ -400,19 +519,42 @@ class InspectTable:
         )
         return manifest_schema
 
-    def _get_all_manifests_schema(self) -> "pa.Schema":
+    def _get_all_manifests_schema(self) -> pa.Schema:
+        """Return the PyArrow schema for the all_manifests metadata table.
+
+        Extends the manifests schema with a ``reference_snapshot_id`` column
+        that identifies which snapshot each manifest was retrieved from, and a
+        ``key_metadata`` column holding the manifest's encryption key metadata.
+
+        Returns:
+            pa.Schema: The manifests schema plus ``reference_snapshot_id``
+                (int64) and ``key_metadata`` (binary, nullable) fields.
+        """
         import pyarrow as pa
 
         all_manifests_schema = self._get_manifests_schema()
         all_manifests_schema = all_manifests_schema.append(pa.field("reference_snapshot_id", pa.int64(), nullable=False))
+        all_manifests_schema = all_manifests_schema.append(pa.field("key_metadata", pa.binary(), nullable=True))
         return all_manifests_schema
 
-    def _generate_manifests_table(self, snapshot: Optional[Snapshot], is_all_manifests_table: bool = False) -> "pa.Table":
+    def _generate_manifests_table(self, snapshot: Snapshot | None, is_all_manifests_table: bool = False) -> pa.Table:
+        """Build a manifests PyArrow Table for the given snapshot.
+
+        Args:
+            snapshot: The snapshot whose manifests to include. If None, an
+                empty table is returned.
+            is_all_manifests_table: If True, appends ``reference_snapshot_id``
+                and ``key_metadata`` columns and uses the all-manifests schema.
+                Defaults to False.
+
+        Returns:
+            pa.Table: One row per manifest file in the snapshot.
+        """
         import pyarrow as pa
 
         def _partition_summaries_to_rows(
-            spec: PartitionSpec, partition_summaries: List[PartitionFieldSummary]
-        ) -> List[Dict[str, Any]]:
+            spec: PartitionSpec, partition_summaries: list[PartitionFieldSummary]
+        ) -> list[dict[str, Any]]:
             rows = []
             for i, field_summary in enumerate(partition_summaries):
                 field = spec.fields[i]
@@ -423,7 +565,7 @@ class InspectTable:
                             partition_field_type, from_bytes(partition_field_type, field_summary.lower_bound)
                         )
                     )
-                    if field_summary.lower_bound
+                    if field_summary.lower_bound is not None
                     else None
                 )
                 upper_bound = (
@@ -432,7 +574,7 @@ class InspectTable:
                             partition_field_type, from_bytes(partition_field_type, field_summary.upper_bound)
                         )
                     )
-                    if field_summary.upper_bound
+                    if field_summary.upper_bound is not None
                     else None
                 )
                 rows.append(
@@ -469,6 +611,7 @@ class InspectTable:
                 }
                 if is_all_manifests_table:
                     manifest_row["reference_snapshot_id"] = snapshot.snapshot_id
+                    manifest_row["key_metadata"] = manifest.key_metadata
                 manifests.append(manifest_row)
 
         return pa.Table.from_pylist(
@@ -476,10 +619,28 @@ class InspectTable:
             schema=self._get_all_manifests_schema() if is_all_manifests_table else self._get_manifests_schema(),
         )
 
-    def manifests(self) -> "pa.Table":
+    def manifests(self) -> pa.Table:
+        """Return the manifest files for the current snapshot as a PyArrow Table.
+
+        Returns:
+            pa.Table: Manifest metadata for the current snapshot, or an empty
+                table if the table has no snapshots.
+                See ``_get_manifests_schema`` for the full column list.
+        """
         return self._generate_manifests_table(self.tbl.current_snapshot())
 
-    def metadata_log_entries(self) -> "pa.Table":
+    def metadata_log_entries(self) -> pa.Table:
+        """Return the metadata log of the table as a PyArrow Table.
+
+        Each row corresponds to a metadata file that was previously current,
+        plus the current metadata file appended as the final row.
+
+        Returns:
+            pa.Table: A table with columns: ``timestamp`` (timestamp[ms]),
+                ``file`` (string), ``latest_snapshot_id`` (int64, nullable),
+                ``latest_schema_id`` (int32, nullable), and
+                ``latest_sequence_number`` (int64, nullable).
+        """
         import pyarrow as pa
 
         from pyiceberg.table.snapshots import MetadataLogEntry
@@ -494,7 +655,7 @@ class InspectTable:
             ]
         )
 
-        def metadata_log_entry_to_row(metadata_entry: MetadataLogEntry) -> Dict[str, Any]:
+        def metadata_log_entry_to_row(metadata_entry: MetadataLogEntry) -> dict[str, Any]:
             latest_snapshot = self.tbl.snapshot_as_of_timestamp(metadata_entry.timestamp_ms)
             return {
                 "timestamp": metadata_entry.timestamp_ms,
@@ -515,7 +676,17 @@ class InspectTable:
             schema=table_schema,
         )
 
-    def history(self) -> "pa.Table":
+    def history(self) -> pa.Table:
+        """Return the snapshot history of the table as a PyArrow Table.
+
+        Each row is one snapshot-log entry, showing when the snapshot became
+        current and whether it is an ancestor of the current snapshot.
+
+        Returns:
+            pa.Table: A table with columns: ``made_current_at`` (timestamp[ms]),
+                ``snapshot_id`` (int64), ``parent_id`` (int64, nullable), and
+                ``is_current_ancestor`` (bool).
+        """
         import pyarrow as pa
 
         history_schema = pa.schema(
@@ -531,9 +702,10 @@ class InspectTable:
 
         history = []
         metadata = self.tbl.metadata
+        snapshots_by_id = self._get_snapshots_by_id()
 
         for snapshot_entry in metadata.snapshot_log:
-            snapshot = metadata.snapshot_by_id(snapshot_entry.snapshot_id)
+            snapshot = snapshots_by_id.get(snapshot_entry.snapshot_id)
 
             history.append(
                 {
@@ -547,8 +719,19 @@ class InspectTable:
         return pa.Table.from_pylist(history, schema=history_schema)
 
     def _get_files_from_manifest(
-        self, manifest_list: ManifestFile, data_file_filter: Optional[Set[DataFileContent]] = None
-    ) -> "pa.Table":
+        self, manifest_list: ManifestFile, data_file_filter: set[DataFileContent] | None = None
+    ) -> pa.Table:
+        """Read file-level metadata entries from a single manifest file.
+
+        Args:
+            manifest_list: The manifest file to read entries from.
+            data_file_filter: If provided, only files whose ``DataFileContent``
+                is in this set are included. If None, all file types are returned.
+
+        Returns:
+            pa.Table: File metadata rows conforming to the files schema.
+                See ``_get_files_schema`` for the full column list.
+        """
         import pyarrow as pa
 
         files: list[dict[str, Any]] = []
@@ -571,12 +754,8 @@ class InspectTable:
                     "value_count": value_counts.get(field.field_id),
                     "null_value_count": null_value_counts.get(field.field_id),
                     "nan_value_count": nan_value_counts.get(field.field_id),
-                    "lower_bound": from_bytes(field.field_type, lower_bound)
-                    if (lower_bound := lower_bounds.get(field.field_id))
-                    else None,
-                    "upper_bound": from_bytes(field.field_type, upper_bound)
-                    if (upper_bound := upper_bounds.get(field.field_id))
-                    else None,
+                    "lower_bound": _readable_bound(field.field_type, lower_bounds.get(field.field_id)),
+                    "upper_bound": _readable_bound(field.field_type, upper_bounds.get(field.field_id)),
                 }
                 for field in self.tbl.metadata.schema().fields
             }
@@ -612,7 +791,20 @@ class InspectTable:
             schema=self._get_files_schema(),
         )
 
-    def _get_files_schema(self) -> "pa.Schema":
+    def _get_files_schema(self) -> pa.Schema:
+        """Return the PyArrow schema for file-level metadata tables.
+
+        The schema is table-specific because the ``readable_metrics`` struct
+        is derived from the current table schema's field names and types.
+
+        Returns:
+            pa.Schema: Schema with fields: ``content``, ``file_path``,
+                ``file_format``, ``spec_id``, ``partition``, ``record_count``,
+                ``file_size_in_bytes``, ``column_sizes``, ``value_counts``,
+                ``null_value_counts``, ``nan_value_counts``, ``lower_bounds``,
+                ``upper_bounds``, ``key_metadata``, ``split_offsets``,
+                ``equality_ids``, ``sort_order_id``, and ``readable_metrics``.
+        """
         import pyarrow as pa
 
         from pyiceberg.io.pyarrow import schema_to_pyarrow
@@ -665,7 +857,20 @@ class InspectTable:
         )
         return files_schema
 
-    def _files(self, snapshot_id: Optional[int] = None, data_file_filter: Optional[Set[DataFileContent]] = None) -> "pa.Table":
+    def _files(self, snapshot_id: int | None = None, data_file_filter: set[DataFileContent] | None = None) -> pa.Table:
+        """Return file metadata for a snapshot, optionally filtered by content type.
+
+        Reads all manifests in the snapshot concurrently using the configured executor.
+
+        Args:
+            snapshot_id: The snapshot to inspect. Defaults to the current snapshot.
+                Returns an empty table if no current snapshot exists.
+            data_file_filter: If provided, only files whose ``DataFileContent``
+                is in this set are returned. If None, all file types are returned.
+
+        Returns:
+            pa.Table: Concatenated file metadata from all manifests in the snapshot.
+        """
         import pyarrow as pa
 
         if not snapshot_id and not self.tbl.metadata.current_snapshot():
@@ -682,68 +887,125 @@ class InspectTable:
         )
         return pa.concat_tables(results)
 
-    def files(self, snapshot_id: Optional[int] = None) -> "pa.Table":
+    def files(self, snapshot_id: int | None = None) -> pa.Table:
+        """Return data and delete files for a snapshot as a PyArrow Table.
+
+        Args:
+            snapshot_id: The snapshot to inspect. Defaults to the current snapshot.
+
+        Returns:
+            pa.Table: File metadata for all content types.
+                See ``_get_files_schema`` for the full column list.
+        """
         return self._files(snapshot_id)
 
-    def data_files(self, snapshot_id: Optional[int] = None) -> "pa.Table":
+    def data_files(self, snapshot_id: int | None = None) -> pa.Table:
+        """Return only data files for a snapshot as a PyArrow Table.
+
+        Args:
+            snapshot_id: The snapshot to inspect. Defaults to the current snapshot.
+
+        Returns:
+            pa.Table: File metadata for data files only.
+                See ``_get_files_schema`` for the full column list.
+        """
         return self._files(snapshot_id, {DataFileContent.DATA})
 
-    def delete_files(self, snapshot_id: Optional[int] = None) -> "pa.Table":
+    def delete_files(self, snapshot_id: int | None = None) -> pa.Table:
+        """Return only delete files for a snapshot as a PyArrow Table.
+
+        Includes both position delete and equality delete files.
+
+        Args:
+            snapshot_id: The snapshot to inspect. Defaults to the current snapshot.
+
+        Returns:
+            pa.Table: File metadata for position and equality delete files.
+                See ``_get_files_schema`` for the full column list.
+        """
         return self._files(snapshot_id, {DataFileContent.POSITION_DELETES, DataFileContent.EQUALITY_DELETES})
 
-    def all_manifests(self, snapshots: Optional[Union[list[Snapshot], list[int]]] = None) -> "pa.Table":
+    def all_manifests(self) -> pa.Table:
+        """Return manifests across all snapshots as a PyArrow Table.
+
+        Includes a ``reference_snapshot_id`` column to identify which snapshot
+        each manifest belongs to, and a ``key_metadata`` column. Manifests
+        shared across snapshots may appear more than once.
+
+        Returns:
+            pa.Table: Manifest metadata across all snapshots, or an empty table
+                if the table has no snapshots.
+                See ``_get_all_manifests_schema`` for the full column list.
+        """
         import pyarrow as pa
 
-        # coerce into snapshot objects if users passes in snapshot ids
-        if snapshots is not None:
-            if isinstance(snapshots[0], int):
-                snapshots = [
-                    snapshot
-                    for snapshot_id in snapshots
-                    if (snapshot := self.tbl.metadata.snapshot_by_id(snapshot_id)) is not None
-                ]
-        else:
-            snapshots = self.tbl.snapshots()
-
+        snapshots = self.tbl.snapshots()
         if not snapshots:
             return pa.Table.from_pylist([], schema=self._get_all_manifests_schema())
 
         executor = ExecutorFactory.get_or_create()
-        manifests_by_snapshots: Iterator["pa.Table"] = executor.map(
+        manifests_by_snapshots: Iterator[pa.Table] = executor.map(
             lambda args: self._generate_manifests_table(*args), [(snapshot, True) for snapshot in snapshots]
         )
         return pa.concat_tables(manifests_by_snapshots)
 
     def _all_known_files(self) -> dict[str, set[str]]:
-        """Get all the known files in the table.
+        """Return every file path referenced by the table metadata, grouped by file type.
+
+        Files reachable from every snapshot are included, not only the ancestors of the
+        current snapshot. Manifest entries with a ``DELETED`` status are included as well,
+        so that the result errs on the side of keeping files.
 
         Returns:
-            dict of {file_type: set of file paths} for each file type.
+            dict of {file_type: set of file paths} with the keys ``metadata``, ``manifest_lists``,
+            ``manifests``, ``data_files``, ``delete_files``, ``statistics`` and ``partition_statistics``.
         """
         snapshots = self.tbl.snapshots()
+        executor = ExecutorFactory.get_or_create()
 
-        _all_known_files = {}
-        _all_known_files["manifests"] = set(self.all_manifests(snapshots)["path"].to_pylist())
-        _all_known_files["manifest_lists"] = {snapshot.manifest_list for snapshot in snapshots}
-        _all_known_files["statistics"] = {statistic.statistics_path for statistic in self.tbl.metadata.statistics}
-        _all_known_files["partition_statistics"] = {
-            statistic.statistics_path for statistic in self.tbl.metadata.partition_statistics
-        }
+        manifest_lists = executor.map(lambda snapshot: snapshot.manifests(self.tbl.io), snapshots)
+        unique_manifests = {manifest.manifest_path: manifest for manifest_list in manifest_lists for manifest in manifest_list}
+
+        def _content_files(manifest: ManifestFile) -> list[DataFile]:
+            return [entry.data_file for entry in manifest.fetch_manifest_entry(io=self.tbl.io, discard_deleted=False)]
+
+        data_files: set[str] = set()
+        delete_files: set[str] = set()
+        for content_file in itertools.chain.from_iterable(executor.map(_content_files, unique_manifests.values())):
+            if content_file.content == DataFileContent.DATA:
+                data_files.add(content_file.file_path)
+            else:
+                delete_files.add(content_file.file_path)
 
         metadata_files = {entry.metadata_file for entry in self.tbl.metadata.metadata_log}
-        metadata_files.add(self.tbl.metadata_location)  # Include current metadata file
-        _all_known_files["metadata"] = metadata_files
+        metadata_files.add(self.tbl.metadata_location)
 
-        executor = ExecutorFactory.get_or_create()
-        snapshot_ids = [snapshot.snapshot_id for snapshot in snapshots]
-        files_by_snapshots: Iterator[Set[str]] = executor.map(
-            lambda snapshot_id: set(self.files(snapshot_id)["file_path"].to_pylist()), snapshot_ids
-        )
-        _all_known_files["datafiles"] = reduce(set.union, files_by_snapshots, set())
+        return {
+            "metadata": metadata_files,
+            "manifest_lists": {snapshot.manifest_list for snapshot in snapshots},
+            "manifests": set(unique_manifests),
+            "data_files": data_files,
+            "delete_files": delete_files,
+            "statistics": {statistics_file.statistics_path for statistics_file in self.tbl.metadata.statistics},
+            "partition_statistics": {
+                statistics_file.statistics_path for statistics_file in self.tbl.metadata.partition_statistics
+            },
+        }
 
-        return _all_known_files
+    def _all_files(self, data_file_filter: set[DataFileContent] | None = None) -> pa.Table:
+        """Return file metadata across all snapshots, optionally filtered by content type.
 
-    def _all_files(self, data_file_filter: Optional[Set[DataFileContent]] = None) -> "pa.Table":
+        Deduplicates manifests by path so each unique manifest is read only once,
+        regardless of how many snapshots reference it.
+
+        Args:
+            data_file_filter: If provided, only files whose ``DataFileContent``
+                is in this set are returned. If None, all file types are returned.
+
+        Returns:
+            pa.Table: File metadata from all unique manifests across all snapshots,
+                or an empty table if the table has no snapshots.
+        """
         import pyarrow as pa
 
         snapshots = self.tbl.snapshots()
@@ -761,11 +1023,32 @@ class InspectTable:
 
         return pa.concat_tables(file_lists)
 
-    def all_files(self) -> "pa.Table":
+    def all_files(self) -> pa.Table:
+        """Return data and delete files across all snapshots as a PyArrow Table.
+
+        Returns:
+            pa.Table: File metadata for all content types across all snapshots.
+                See ``_get_files_schema`` for the full column list.
+        """
         return self._all_files()
 
-    def all_data_files(self) -> "pa.Table":
+    def all_data_files(self) -> pa.Table:
+        """Return all data files across all snapshots as a PyArrow Table.
+
+        Returns:
+            pa.Table: File metadata for data files only, across all snapshots.
+                See ``_get_files_schema`` for the full column list.
+        """
         return self._all_files({DataFileContent.DATA})
 
-    def all_delete_files(self) -> "pa.Table":
+    def all_delete_files(self) -> pa.Table:
+        """Return all delete files across all snapshots as a PyArrow Table.
+
+        Includes both position delete and equality delete files.
+
+        Returns:
+            pa.Table: File metadata for position and equality delete files,
+                across all snapshots.
+                See ``_get_files_schema`` for the full column list.
+        """
         return self._all_files({DataFileContent.POSITION_DELETES, DataFileContent.EQUALITY_DELETES})

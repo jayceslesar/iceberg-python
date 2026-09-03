@@ -3,6 +3,8 @@
 .cache
 tmp/
 site
+.env
+dev/.env
 
 # intellij files
 .idea
@@ -21,6 +23,7 @@ __pycache__/
 .tox/
 env/
 venv/
+.venv/
 *.egg-info/
 test-reports
 build/
@@ -37,16 +40,12 @@ coverage.xml
 bin/
 .vscode/
 
-# Hive/metastore files
-metastore_db/
-
-# Spark/metastore files
-spark-warehouse/
-derby.log
-
 # Python stuff
 .mypy_cache/
 htmlcov
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
 
 pyiceberg/avro/decoder_fast.c
 pyiceberg/avro/*.html

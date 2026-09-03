@@ -18,12 +18,13 @@
 import json
 import uuid
 from copy import copy
-from typing import Any, Dict
+from typing import Any
 
 import pytest
-from pydantic import ValidationError
-from sortedcontainers import SortedList
+from pydantic import BaseModel, ValidationError
+from pytest_lazy_fixtures import lf
 
+from pyiceberg.catalog import Catalog
 from pyiceberg.catalog.noop import NoopCatalog
 from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.expressions import (
@@ -32,24 +33,18 @@ from pyiceberg.expressions import (
     EqualTo,
     In,
 )
-from pyiceberg.io import PY_IO_IMPL, load_file_io
-from pyiceberg.manifest import (
-    DataFile,
-    DataFileContent,
-    FileFormat,
-    ManifestEntry,
-    ManifestEntryStatus,
-)
+from pyiceberg.expressions.visitors import bind
+from pyiceberg.io import PY_IO_IMPL, FileIO, load_file_io
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import (
     CommitTableRequest,
+    StagedTable,
     StaticTable,
     Table,
     TableIdentifier,
-    _match_deletes_to_data_file,
 )
-from pyiceberg.table.metadata import INITIAL_SEQUENCE_NUMBER, TableMetadataUtil, TableMetadataV2, _generate_snapshot_id
+from pyiceberg.table.metadata import TableMetadataUtil, TableMetadataV1, TableMetadataV2, _generate_snapshot_id
 from pyiceberg.table.refs import MAIN_BRANCH, SnapshotRef, SnapshotRefType
 from pyiceberg.table.snapshots import (
     MetadataLogEntry,
@@ -66,6 +61,7 @@ from pyiceberg.table.sorting import (
 )
 from pyiceberg.table.statistics import BlobMetadata, PartitionStatisticsFile, StatisticsFile
 from pyiceberg.table.update import (
+    AddPartitionSpecUpdate,
     AddSnapshotUpdate,
     AddSortOrderUpdate,
     AssertCreate,
@@ -76,8 +72,10 @@ from pyiceberg.table.update import (
     AssertLastAssignedPartitionId,
     AssertRefSnapshotId,
     AssertTableUUID,
+    RemovePartitionSpecsUpdate,
     RemovePartitionStatisticsUpdate,
     RemovePropertiesUpdate,
+    RemoveSchemasUpdate,
     RemoveSnapshotRefUpdate,
     RemoveSnapshotsUpdate,
     RemoveStatisticsUpdate,
@@ -95,6 +93,7 @@ from pyiceberg.transforms import (
     BucketTransform,
     IdentityTransform,
 )
+from pyiceberg.typedef import Record
 from pyiceberg.types import (
     BinaryType,
     BooleanType,
@@ -265,8 +264,15 @@ def test_history(table_v2: Table) -> None:
     ]
 
 
-def test_table_scan_select(table_v2: Table) -> None:
-    scan = table_v2.scan()
+@pytest.mark.parametrize(
+    "table_fixture",
+    [
+        pytest.param(lf("table_v2"), id="parquet"),
+        pytest.param(lf("table_v2_orc"), id="orc"),
+    ],
+)
+def test_table_scan_select(table_fixture: Table) -> None:
+    scan = table_fixture.scan()
     assert scan.selected_fields == ("*",)
     assert scan.select("a", "b").selected_fields == ("a", "b")
     assert scan.select("a", "c").select("a").selected_fields == ("a",)
@@ -334,6 +340,228 @@ def test_table_scan_projection_unknown_column(table_v2: Table) -> None:
     assert "Could not find column: 'a'" in str(exc_info.value)
 
 
+def test_data_scan_plan_files_no_current_snapshot(example_table_metadata_no_snapshot_v1: dict[str, Any]) -> None:
+    table = Table(
+        identifier=("default", "test_no_snapshot"),
+        metadata=TableMetadataV1(**example_table_metadata_no_snapshot_v1),
+        metadata_location="s3://bucket/test/metadata.json",
+        io=load_file_io(),
+        catalog=NoopCatalog("noop"),
+    )
+    assert table.current_snapshot() is None
+
+    scan = table.scan()
+    assert list(scan.plan_files()) == []
+    assert scan.count() == 0
+    assert len(scan.to_arrow()) == 0
+
+
+def test_incremental_append_scan_default(table_v2: Table) -> None:
+    scan = table_v2.incremental_append_scan()
+    assert scan.row_filter == AlwaysTrue()
+    assert scan.selected_fields == ("*",)
+    assert scan.case_sensitive is True
+    assert scan.from_snapshot_id is None
+    assert scan.from_snapshot_inclusive is False
+    assert scan.to_snapshot_id is None
+
+
+def test_incremental_append_scan_no_current_snapshot(example_table_metadata_no_snapshot_v1: dict[str, Any]) -> None:
+    table = Table(
+        identifier=("default", "test_no_snapshot"),
+        metadata=TableMetadataV1(**example_table_metadata_no_snapshot_v1),
+        metadata_location="s3://bucket/test/metadata.json",
+        io=load_file_io(),
+        catalog=NoopCatalog("noop"),
+    )
+    assert table.current_snapshot() is None
+
+    # With no range set and no current snapshot, there is nothing to scan.
+    assert list(table.incremental_append_scan().plan_files()) == []
+
+    # The guard doesn't mask a missing end: an explicit start with no resolvable end still errors.
+    with pytest.raises(ValueError, match="End snapshot is not set and table has no current snapshot"):
+        list(table.incremental_append_scan(from_snapshot_id_exclusive=42).plan_files())
+
+
+def test_incremental_append_scan_factory_maps_to_exclusive_from(table_v2: Table) -> None:
+    older_snapshot_id, newer_snapshot_id = 3051729675574597004, 3055729675574597004
+    scan = table_v2.incremental_append_scan(
+        from_snapshot_id_exclusive=older_snapshot_id,
+        to_snapshot_id_inclusive=newer_snapshot_id,
+    )
+    assert scan.from_snapshot_id == older_snapshot_id
+    assert scan.from_snapshot_inclusive is False
+    assert scan.to_snapshot_id == newer_snapshot_id
+
+
+def test_incremental_append_scan_builders(table_v2: Table) -> None:
+    older_snapshot_id, newer_snapshot_id = 3051729675574597004, 3055729675574597004
+    # Builders return refined copies; the snapshot-independent helpers still chain and must
+    # round-trip the range through `update()`.
+    scan = (
+        table_v2.incremental_append_scan()
+        .from_snapshot_id_exclusive(older_snapshot_id)
+        .to_snapshot_id_inclusive(newer_snapshot_id)
+        .filter(EqualTo("x", 1))
+        .select("x", "y")
+        .with_case_sensitive(False)
+    )
+    assert scan.from_snapshot_id == older_snapshot_id
+    assert scan.from_snapshot_inclusive is False
+    assert scan.to_snapshot_id == newer_snapshot_id
+    assert scan.row_filter == EqualTo("x", 1)
+    assert set(scan.selected_fields) == {"x", "y"}
+    assert scan.case_sensitive is False
+
+    # `from_snapshot_id_inclusive` flips the flag on the same slot.
+    inclusive_scan = table_v2.incremental_append_scan().from_snapshot_id_inclusive(older_snapshot_id)
+    assert inclusive_scan.from_snapshot_id == older_snapshot_id
+    assert inclusive_scan.from_snapshot_inclusive is True
+
+
+def test_incremental_append_scan_projection_uses_current_schema(table_v2: Table) -> None:
+    scan = table_v2.incremental_append_scan(selected_fields=("x", "y"))
+    projection_schema = scan.projection()
+    assert projection_schema.schema_id == 1
+    assert {f.name for f in projection_schema.fields} == {"x", "y"}
+
+
+def test_incremental_append_scan_unset_from_resolves_to_oldest_ancestor(table_v2: Table) -> None:
+    older_snapshot_id, current_snapshot_id = 3051729675574597004, 3055729675574597004
+    # `older` is the oldest ancestor of `current`; an unset start resolves to a None exclusive
+    # boundary (i.e. the whole lineage of the end snapshot is in range).
+    scan = table_v2.incremental_append_scan(to_snapshot_id_inclusive=current_snapshot_id)
+    assert scan._validate_and_resolve_snapshots() == (None, current_snapshot_id)
+    assert table_v2.snapshot_by_id(older_snapshot_id).parent_snapshot_id is None  # type: ignore[union-attr]
+
+
+def test_incremental_append_scan_inclusive_from_resolves_to_parent(table_v2: Table) -> None:
+    older_snapshot_id, current_snapshot_id = 3051729675574597004, 3055729675574597004
+    # An inclusive start resolves to its parent as the exclusive boundary; `older` is the root,
+    # so its parent (None) becomes the boundary and the start snapshot itself stays in range.
+    scan = table_v2.incremental_append_scan().from_snapshot_id_inclusive(older_snapshot_id)
+    assert scan._validate_and_resolve_snapshots() == (None, current_snapshot_id)
+
+    # An inclusive start that isn't an ancestor of the end snapshot is rejected.
+    bad_scan = table_v2.incremental_append_scan(to_snapshot_id_inclusive=older_snapshot_id).from_snapshot_id_inclusive(
+        current_snapshot_id
+    )
+    with pytest.raises(ValueError, match="Starting snapshot .inclusive. .* is not an ancestor"):
+        bad_scan._validate_and_resolve_snapshots()
+
+    # Unlike an exclusive start (which admits an expired snapshot), an inclusive start must be
+    # present in the metadata, since its parent is needed to form the exclusive boundary.
+    missing_scan = table_v2.incremental_append_scan().from_snapshot_id_inclusive(42)
+    with pytest.raises(ValueError, match="Start snapshot .inclusive. not found in table metadata: 42"):
+        missing_scan._validate_and_resolve_snapshots()
+
+
+def test_incremental_append_scan_invalid_to_snapshot(table_v2: Table) -> None:
+    scan = table_v2.incremental_append_scan(
+        from_snapshot_id_exclusive=3051729675574597004,
+        to_snapshot_id_inclusive=42,
+    )
+    with pytest.raises(ValueError, match="End snapshot not found in table metadata: 42"):
+        list(scan.plan_files())
+
+
+@pytest.mark.parametrize(
+    "from_snapshot_id, to_snapshot_id, expected",
+    [
+        # Fabricated 'from' snapshot ID, unrelated to the table.
+        (42, 3055729675574597004, "Starting snapshot .exclusive. 42 is not a parent ancestor"),
+        # 'from' and 'to' reversed (newer used as exclusive start).
+        (3055729675574597004, 3051729675574597004, "is not a parent ancestor of end snapshot"),
+        # Equal from/to: a snapshot is never its own parent ancestor.
+        (3055729675574597004, 3055729675574597004, "is not a parent ancestor of end snapshot"),
+    ],
+)
+def test_incremental_append_scan_rejects_non_parent_ancestor_from(
+    table_v2: Table, from_snapshot_id: int, to_snapshot_id: int, expected: str
+) -> None:
+    scan = table_v2.incremental_append_scan(
+        from_snapshot_id_exclusive=from_snapshot_id,
+        to_snapshot_id_inclusive=to_snapshot_id,
+    )
+    with pytest.raises(ValueError, match=expected):
+        list(scan.plan_files())
+
+
+def test_incremental_append_scan_to_snapshot_defaults_to_current(table_v2: Table) -> None:
+    older_snapshot_id, current_snapshot_id = 3051729675574597004, 3055729675574597004
+    assert table_v2.current_snapshot().snapshot_id == current_snapshot_id  # type: ignore[union-attr]
+
+    # Omitting `to_snapshot_id_inclusive` resolves to the table's current snapshot.
+    scan = table_v2.incremental_append_scan(from_snapshot_id_exclusive=older_snapshot_id)
+    assert scan._validate_and_resolve_snapshots() == (older_snapshot_id, current_snapshot_id)
+
+
+def test_incremental_append_scan_admits_expired_from_snapshot(example_table_metadata_v2: dict[str, Any]) -> None:
+    # The exclusive `from` snapshot does not need to be present in the table metadata, as long as
+    # some ancestor of `to` references it as a parent. Here we drop the oldest snapshot from the
+    # metadata (simulating snapshot expiration) and verify that the remaining-but-now-expired
+    # snapshot ID is still accepted as the exclusive `from`.
+    expired_snapshot_id = 3051729675574597004
+    remaining_snapshot_id = 3055729675574597004
+
+    metadata_dict = {**example_table_metadata_v2}
+    metadata_dict["snapshots"] = [
+        snapshot for snapshot in metadata_dict["snapshots"] if snapshot["snapshot-id"] != expired_snapshot_id
+    ]
+    # The remaining snapshot still references the expired one as its parent.
+    table = Table(
+        identifier=("dummy", "test"),
+        metadata=TableMetadataV2(**metadata_dict),
+        metadata_location="s3://bucket/test/metadata.json",
+        io=load_file_io(),
+        catalog=NoopCatalog("noop"),
+    )
+    assert table.snapshot_by_id(expired_snapshot_id) is None
+    assert table.snapshot_by_id(remaining_snapshot_id) is not None
+
+    scan = table.incremental_append_scan(
+        from_snapshot_id_exclusive=expired_snapshot_id,
+        to_snapshot_id_inclusive=remaining_snapshot_id,
+    )
+    # The private validation method must accept this combination; we don't call `plan_files()` here
+    # because that would require real manifest files.
+    assert scan._validate_and_resolve_snapshots() == (expired_snapshot_id, remaining_snapshot_id)
+
+
+def test_incremental_append_scan_update_preserves_type(table_v2: Table) -> None:
+    # `update()` lives on BaseScan and uses `type(self)(...)` to construct the copy;
+    # verify the concrete type is preserved through both `update` and the fluent helpers.
+    base_scan = table_v2.incremental_append_scan(from_snapshot_id_exclusive=123)
+    base_type = type(base_scan)
+    assert base_type.__name__ == "IncrementalAppendScan"
+    assert type(base_scan.update(from_snapshot_id=456)) is base_type
+    assert type(base_scan.from_snapshot_id_exclusive(456)) is base_type
+    assert type(base_scan.from_snapshot_id_inclusive(456)) is base_type
+    assert type(base_scan.to_snapshot_id_inclusive(789)) is base_type
+    assert type(base_scan.filter(EqualTo("x", 1))) is base_type
+    assert type(base_scan.select("x")) is base_type
+    assert type(base_scan.with_case_sensitive(False)) is base_type
+
+    # The snapshot range round-trips through the public attributes (update() reconstructs by keyword).
+    assert base_scan.from_snapshot_id_inclusive(456).from_snapshot_inclusive is True
+    assert base_scan.to_snapshot_id_inclusive(789).to_snapshot_id == 789
+    assert base_scan.update(to_snapshot_id=789).update(to_snapshot_id=None).to_snapshot_id is None
+
+
+def test_incremental_append_scan_staged_table_raises(table_v2: Table) -> None:
+    # Mirrors StagedTable.scan: a staged table has no committed metadata to scan against.
+    staged_table = StagedTable(
+        identifier=table_v2._identifier,
+        metadata=table_v2.metadata,
+        metadata_location=table_v2.metadata_location,
+        io=table_v2.io,
+        catalog=table_v2.catalog,
+    )
+    with pytest.raises(ValueError, match="Cannot scan a staged table"):
+        staged_table.incremental_append_scan()
+
+
 def test_static_table_same_as_table(table_v2: Table, metadata_location: str) -> None:
     static_table = StaticTable.from_metadata(metadata_location)
     assert isinstance(static_table, Table)
@@ -346,124 +574,25 @@ def test_static_table_gz_same_as_table(table_v2: Table, metadata_location_gz: st
     assert static_table.metadata == table_v2.metadata
 
 
-def test_static_table_version_hint_same_as_table(table_v2: Table, table_location: str) -> None:
-    static_table = StaticTable.from_metadata(table_location)
-    assert isinstance(static_table, Table)
-    assert static_table.metadata == table_v2.metadata
+def test_static_table_version_hint_same_as_table(
+    table_v2: Table,
+    table_location_with_version_hint_full: str,
+    table_location_with_version_hint_numeric: str,
+    table_location_with_version_hint_non_numeric: str,
+) -> None:
+    for table_location in [
+        table_location_with_version_hint_full,
+        table_location_with_version_hint_numeric,
+        table_location_with_version_hint_non_numeric,
+    ]:
+        static_table = StaticTable.from_metadata(table_location)
+        assert isinstance(static_table, Table)
+        assert static_table.metadata == table_v2.metadata
 
 
 def test_static_table_io_does_not_exist(metadata_location: str) -> None:
     with pytest.raises(ValueError):
         StaticTable.from_metadata(metadata_location, {PY_IO_IMPL: "pyiceberg.does.not.exist.FileIO"})
-
-
-def test_match_deletes_to_datafile() -> None:
-    data_entry = ManifestEntry.from_args(
-        status=ManifestEntryStatus.ADDED,
-        sequence_number=1,
-        data_file=DataFile.from_args(
-            content=DataFileContent.DATA,
-            file_path="s3://bucket/0000.parquet",
-            file_format=FileFormat.PARQUET,
-            partition={},
-            record_count=3,
-            file_size_in_bytes=3,
-        ),
-    )
-    delete_entry_1 = ManifestEntry.from_args(
-        status=ManifestEntryStatus.ADDED,
-        sequence_number=0,  # Older than the data
-        data_file=DataFile.from_args(
-            content=DataFileContent.POSITION_DELETES,
-            file_path="s3://bucket/0001-delete.parquet",
-            file_format=FileFormat.PARQUET,
-            partition={},
-            record_count=3,
-            file_size_in_bytes=3,
-        ),
-    )
-    delete_entry_2 = ManifestEntry.from_args(
-        status=ManifestEntryStatus.ADDED,
-        sequence_number=3,
-        data_file=DataFile.from_args(
-            content=DataFileContent.POSITION_DELETES,
-            file_path="s3://bucket/0002-delete.parquet",
-            file_format=FileFormat.PARQUET,
-            partition={},
-            record_count=3,
-            file_size_in_bytes=3,
-            # We don't really care about the tests here
-            value_counts={},
-            null_value_counts={},
-            nan_value_counts={},
-            lower_bounds={},
-            upper_bounds={},
-        ),
-    )
-    assert _match_deletes_to_data_file(
-        data_entry,
-        SortedList(iterable=[delete_entry_1, delete_entry_2], key=lambda entry: entry.sequence_number or INITIAL_SEQUENCE_NUMBER),
-    ) == {
-        delete_entry_2.data_file,
-    }
-
-
-def test_match_deletes_to_datafile_duplicate_number() -> None:
-    data_entry = ManifestEntry.from_args(
-        status=ManifestEntryStatus.ADDED,
-        sequence_number=1,
-        data_file=DataFile.from_args(
-            content=DataFileContent.DATA,
-            file_path="s3://bucket/0000.parquet",
-            file_format=FileFormat.PARQUET,
-            partition={},
-            record_count=3,
-            file_size_in_bytes=3,
-        ),
-    )
-    delete_entry_1 = ManifestEntry.from_args(
-        status=ManifestEntryStatus.ADDED,
-        sequence_number=3,
-        data_file=DataFile.from_args(
-            content=DataFileContent.POSITION_DELETES,
-            file_path="s3://bucket/0001-delete.parquet",
-            file_format=FileFormat.PARQUET,
-            partition={},
-            record_count=3,
-            file_size_in_bytes=3,
-            # We don't really care about the tests here
-            value_counts={},
-            null_value_counts={},
-            nan_value_counts={},
-            lower_bounds={},
-            upper_bounds={},
-        ),
-    )
-    delete_entry_2 = ManifestEntry.from_args(
-        status=ManifestEntryStatus.ADDED,
-        sequence_number=3,
-        data_file=DataFile.from_args(
-            content=DataFileContent.POSITION_DELETES,
-            file_path="s3://bucket/0002-delete.parquet",
-            file_format=FileFormat.PARQUET,
-            partition={},
-            record_count=3,
-            file_size_in_bytes=3,
-            # We don't really care about the tests here
-            value_counts={},
-            null_value_counts={},
-            nan_value_counts={},
-            lower_bounds={},
-            upper_bounds={},
-        ),
-    )
-    assert _match_deletes_to_data_file(
-        data_entry,
-        SortedList(iterable=[delete_entry_1, delete_entry_2], key=lambda entry: entry.sequence_number or INITIAL_SEQUENCE_NUMBER),
-    ) == {
-        delete_entry_1.data_file,
-        delete_entry_2.data_file,
-    }
 
 
 def test_serialize_set_properties_updates() -> None:
@@ -525,7 +654,7 @@ def test_update_column(table_v1: Table, table_v2: Table) -> None:
 
 
 def test_add_primitive_type_column(table_v2: Table) -> None:
-    primitive_type: Dict[str, PrimitiveType] = {
+    primitive_type: dict[str, PrimitiveType] = {
         "boolean": BooleanType(),
         "int": IntegerType(),
         "long": LongType(),
@@ -605,6 +734,215 @@ def test_add_nested_list_type_column(table_v2: Table) -> None:
         element_required=False,
     )
     assert new_schema.highest_field_id == 7
+
+
+def test_update_list_element_required(table_v2: Table) -> None:
+    """Test that update_column can change list element's required property."""
+    # Add a list column with optional elements
+    update = UpdateSchema(transaction=table_v2.transaction())
+    update.add_column(path="tags", field_type=ListType(element_id=1, element_type=StringType(), element_required=False))
+    schema_with_list = update._apply()
+
+    # Verify initial state
+    field = schema_with_list.find_field("tags")
+    assert isinstance(field.field_type, ListType)
+    assert field.field_type.element_required is False
+
+    # Update element to required
+    update2 = UpdateSchema(transaction=table_v2.transaction(), allow_incompatible_changes=True, schema=schema_with_list)
+    new_schema = update2.update_column(("tags", "element"), required=True)._apply()
+
+    # Verify the update
+    field = new_schema.find_field("tags")
+    assert isinstance(field.field_type, ListType)
+    assert field.field_type.element_required is True
+
+
+def test_update_map_value_required(table_v2: Table) -> None:
+    """Test that update_column can change map value's required property."""
+    # Add a map column with optional values
+    update = UpdateSchema(transaction=table_v2.transaction())
+    update.add_column(
+        path="metadata",
+        field_type=MapType(key_id=1, key_type=StringType(), value_id=2, value_type=IntegerType(), value_required=False),
+    )
+    schema_with_map = update._apply()
+
+    # Verify initial state
+    field = schema_with_map.find_field("metadata")
+    assert isinstance(field.field_type, MapType)
+    assert field.field_type.value_required is False
+
+    # Update value to required
+    update2 = UpdateSchema(transaction=table_v2.transaction(), allow_incompatible_changes=True, schema=schema_with_map)
+    new_schema = update2.update_column(("metadata", "value"), required=True)._apply()
+
+    # Verify the update
+    field = new_schema.find_field("metadata")
+    assert isinstance(field.field_type, MapType)
+    assert field.field_type.value_required is True
+
+
+def test_update_list_element_required_to_optional(table_v2: Table) -> None:
+    """Test that update_column can change list element from required to optional (safe direction)."""
+    # Add a list column with required elements
+    update = UpdateSchema(transaction=table_v2.transaction())
+    update.add_column(path="tags", field_type=ListType(element_id=1, element_type=StringType(), element_required=True))
+    schema_with_list = update._apply()
+
+    # Verify initial state
+    field = schema_with_list.find_field("tags")
+    assert isinstance(field.field_type, ListType)
+    assert field.field_type.element_required is True
+
+    # Update element to optional - should work without allow_incompatible_changes
+    update2 = UpdateSchema(transaction=table_v2.transaction(), schema=schema_with_list)
+    new_schema = update2.update_column(("tags", "element"), required=False)._apply()
+
+    # Verify the update
+    field = new_schema.find_field("tags")
+    assert isinstance(field.field_type, ListType)
+    assert field.field_type.element_required is False
+
+
+def test_update_list_element_required_fails_without_allow_incompatible(table_v2: Table) -> None:
+    """Test that optional -> required fails without allow_incompatible_changes."""
+    # Add a list column with optional elements
+    update = UpdateSchema(transaction=table_v2.transaction())
+    update.add_column(path="tags", field_type=ListType(element_id=1, element_type=StringType(), element_required=False))
+    schema_with_list = update._apply()
+
+    # Try to update element to required without allow_incompatible_changes - should fail
+    update2 = UpdateSchema(transaction=table_v2.transaction(), schema=schema_with_list)
+    with pytest.raises(ValueError, match="Cannot change column nullability"):
+        update2.update_column(("tags", "element"), required=True)._apply()
+
+
+def test_update_map_value_required_fails_without_allow_incompatible(table_v2: Table) -> None:
+    """Test that optional -> required for map value fails without allow_incompatible_changes."""
+    # Add a map column with optional values
+    update = UpdateSchema(transaction=table_v2.transaction())
+    update.add_column(
+        path="metadata",
+        field_type=MapType(key_id=1, key_type=StringType(), value_id=2, value_type=IntegerType(), value_required=False),
+    )
+    schema_with_map = update._apply()
+
+    # Try to update value to required without allow_incompatible_changes - should fail
+    update2 = UpdateSchema(transaction=table_v2.transaction(), schema=schema_with_map)
+    with pytest.raises(ValueError, match="Cannot change column nullability"):
+        update2.update_column(("metadata", "value"), required=True)._apply()
+
+
+def test_update_map_key_fails(table_v2: Table) -> None:
+    """Test that updating map keys is not allowed."""
+    # Add a map column
+    update = UpdateSchema(transaction=table_v2.transaction())
+    update.add_column(
+        path="metadata",
+        field_type=MapType(key_id=1, key_type=StringType(), value_id=2, value_type=IntegerType(), value_required=False),
+    )
+    schema_with_map = update._apply()
+
+    # Try to update the key - should fail even with allow_incompatible_changes
+    update2 = UpdateSchema(transaction=table_v2.transaction(), allow_incompatible_changes=True, schema=schema_with_map)
+    with pytest.raises(ValueError, match="Cannot update map keys"):
+        update2.update_column(("metadata", "key"), required=False)._apply()
+
+
+def test_update_map_value_required_to_optional(table_v2: Table) -> None:
+    """Test that update_column can change map value from required to optional (safe direction)."""
+    # Add a map column with required values
+    update = UpdateSchema(transaction=table_v2.transaction())
+    update.add_column(
+        path="metadata",
+        field_type=MapType(key_id=1, key_type=StringType(), value_id=2, value_type=IntegerType(), value_required=True),
+    )
+    schema_with_map = update._apply()
+
+    # Verify initial state
+    field = schema_with_map.find_field("metadata")
+    assert isinstance(field.field_type, MapType)
+    assert field.field_type.value_required is True
+
+    # Update value to optional - should work without allow_incompatible_changes
+    update2 = UpdateSchema(transaction=table_v2.transaction(), schema=schema_with_map)
+    new_schema = update2.update_column(("metadata", "value"), required=False)._apply()
+
+    # Verify the update
+    field = new_schema.find_field("metadata")
+    assert isinstance(field.field_type, MapType)
+    assert field.field_type.value_required is False
+
+
+def test_update_list_and_map_in_single_schema_change(table_v2: Table) -> None:
+    """Test updating both list element and map value required properties in a single schema change."""
+    # Add both a list and a map column with optional elements/values
+    update = UpdateSchema(transaction=table_v2.transaction())
+    update.add_column(path="tags", field_type=ListType(element_id=1, element_type=StringType(), element_required=False))
+    update.add_column(
+        path="metadata",
+        field_type=MapType(key_id=1, key_type=StringType(), value_id=2, value_type=IntegerType(), value_required=False),
+    )
+    schema_with_both = update._apply()
+
+    # Verify initial state
+    list_field = schema_with_both.find_field("tags")
+    assert isinstance(list_field.field_type, ListType)
+    assert list_field.field_type.element_required is False
+
+    map_field = schema_with_both.find_field("metadata")
+    assert isinstance(map_field.field_type, MapType)
+    assert map_field.field_type.value_required is False
+
+    # Update both in a single schema change
+    update2 = UpdateSchema(transaction=table_v2.transaction(), allow_incompatible_changes=True, schema=schema_with_both)
+    update2.update_column(("tags", "element"), required=True)
+    update2.update_column(("metadata", "value"), required=True)
+    new_schema = update2._apply()
+
+    # Verify both updates
+    list_field = new_schema.find_field("tags")
+    assert isinstance(list_field.field_type, ListType)
+    assert list_field.field_type.element_required is True
+
+    map_field = new_schema.find_field("metadata")
+    assert isinstance(map_field.field_type, MapType)
+    assert map_field.field_type.value_required is True
+
+
+def test_update_nested_list_in_struct_required(table_v2: Table) -> None:
+    """Test updating nested list element required property inside a struct."""
+
+    # Add a struct column containing a list
+    update = UpdateSchema(transaction=table_v2.transaction())
+    struct_type = StructType(
+        NestedField(
+            field_id=1,
+            name="coordinates",
+            field_type=ListType(element_id=2, element_type=DoubleType(), element_required=False),
+            required=False,
+        )
+    )
+    update.add_column(path="location", field_type=struct_type)
+    schema_with_nested = update._apply()
+
+    # Verify initial state
+    field = schema_with_nested.find_field("location")
+    assert isinstance(field.field_type, StructType)
+    nested_list = field.field_type.fields[0].field_type
+    assert isinstance(nested_list, ListType)
+    assert nested_list.element_required is False
+
+    # Update nested list element to required
+    update2 = UpdateSchema(transaction=table_v2.transaction(), allow_incompatible_changes=True, schema=schema_with_nested)
+    new_schema = update2.update_column(("location", "coordinates", "element"), required=True)._apply()
+
+    # Verify the update
+    field = new_schema.find_field("location")
+    nested_list = field.field_type.fields[0].field_type
+    assert isinstance(nested_list, ListType)
+    assert nested_list.element_required is True
 
 
 def test_apply_set_properties_update(table_v2: Table) -> None:
@@ -1201,7 +1539,7 @@ def test_correct_schema() -> None:
     assert "Snapshot not found: -1" in str(exc_info.value)
 
 
-def test_table_properties(example_table_metadata_v2: Dict[str, Any]) -> None:
+def test_table_properties(example_table_metadata_v2: dict[str, Any]) -> None:
     # metadata properties are all strings
     for k, v in example_table_metadata_v2["properties"].items():
         assert isinstance(k, str)
@@ -1219,7 +1557,7 @@ def test_table_properties(example_table_metadata_v2: Dict[str, Any]) -> None:
     assert isinstance(new_metadata.properties["property_name"], str)
 
 
-def test_table_properties_raise_for_none_value(example_table_metadata_v2: Dict[str, Any]) -> None:
+def test_table_properties_raise_for_none_value(example_table_metadata_v2: dict[str, Any]) -> None:
     property_with_none = {"property_name": None}
     example_table_metadata_v2 = {**example_table_metadata_v2, "properties": property_with_none}
     with pytest.raises(ValidationError) as exc_info:
@@ -1286,6 +1624,67 @@ def test_update_metadata_log_overflow(table_v2: Table) -> None:
     assert len(new_metadata.metadata_log) == 1
 
 
+def test_remove_partition_spec_update(table_v2: Table) -> None:
+    base_metadata = table_v2.metadata
+    new_spec = PartitionSpec(PartitionField(source_id=2, field_id=1001, transform=IdentityTransform(), name="y"), spec_id=1)
+    metadata_with_new_spec = update_table_metadata(base_metadata, (AddPartitionSpecUpdate(spec=new_spec),))
+
+    assert len(metadata_with_new_spec.partition_specs) == 2
+
+    update = RemovePartitionSpecsUpdate(spec_ids=[1])
+    updated_metadata = update_table_metadata(
+        metadata_with_new_spec,
+        (update,),
+    )
+
+    assert len(updated_metadata.partition_specs) == 1
+
+
+def test_remove_partition_spec_update_spec_does_not_exist(table_v2: Table) -> None:
+    update = RemovePartitionSpecsUpdate(
+        spec_ids=[123],
+    )
+    with pytest.raises(ValueError, match="Partition spec with id 123 does not exist"):
+        update_table_metadata(table_v2.metadata, (update,))
+
+
+def test_remove_partition_spec_update_default_spec(table_v2: Table) -> None:
+    update = RemovePartitionSpecsUpdate(
+        spec_ids=[0],
+    )
+    with pytest.raises(ValueError, match="Cannot remove default partition spec: 0"):
+        update_table_metadata(table_v2.metadata, (update,))
+
+
+def test_remove_schemas_update(table_v2: Table) -> None:
+    base_metadata = table_v2.metadata
+    assert len(base_metadata.schemas) == 2
+
+    update = RemoveSchemasUpdate(schema_ids=[0])
+    updated_metadata = update_table_metadata(
+        base_metadata,
+        (update,),
+    )
+
+    assert len(updated_metadata.schemas) == 1
+
+
+def test_remove_schemas_update_schema_does_not_exist(table_v2: Table) -> None:
+    update = RemoveSchemasUpdate(
+        schema_ids=[123],
+    )
+    with pytest.raises(ValueError, match="Schema with schema id 123 does not exist"):
+        update_table_metadata(table_v2.metadata, (update,))
+
+
+def test_remove_schemas_update_current_schema(table_v2: Table) -> None:
+    update = RemoveSchemasUpdate(
+        schema_ids=[1],
+    )
+    with pytest.raises(ValueError, match="Cannot remove current schema with id 1"):
+        update_table_metadata(table_v2.metadata, (update,))
+
+
 def test_set_statistics_update(table_v2_with_statistics: Table) -> None:
     snapshot_id = table_v2_with_statistics.metadata.current_snapshot_id
 
@@ -1309,6 +1708,8 @@ def test_set_statistics_update(table_v2_with_statistics: Table) -> None:
         snapshot_id=snapshot_id,
         statistics=statistics_file,
     )
+
+    assert model_roundtrips(update)
 
     new_metadata = update_table_metadata(
         table_v2_with_statistics.metadata,
@@ -1344,6 +1745,57 @@ def test_set_statistics_update(table_v2_with_statistics: Table) -> None:
     assert json.loads(updated_statistics[0].model_dump_json()) == json.loads(expected)
 
 
+def test_set_statistics_update_handles_deprecated_snapshot_id(table_v2_with_statistics: Table) -> None:
+    snapshot_id = table_v2_with_statistics.metadata.current_snapshot_id
+
+    blob_metadata = BlobMetadata(
+        type="apache-datasketches-theta-v1",
+        snapshot_id=snapshot_id,
+        sequence_number=2,
+        fields=[1],
+        properties={"prop-key": "prop-value"},
+    )
+
+    statistics_file = StatisticsFile(
+        snapshot_id=snapshot_id,
+        statistics_path="s3://bucket/warehouse/stats.puffin",
+        file_size_in_bytes=124,
+        file_footer_size_in_bytes=27,
+        blob_metadata=[blob_metadata],
+    )
+    update_with_model = SetStatisticsUpdate(statistics=statistics_file)
+    assert model_roundtrips(update_with_model)
+    assert update_with_model.snapshot_id == snapshot_id
+
+    update_with_dict = SetStatisticsUpdate.model_validate({"statistics": statistics_file.model_dump()})
+    assert model_roundtrips(update_with_dict)
+    assert update_with_dict.snapshot_id == snapshot_id
+
+    update_json = """
+        {
+            "statistics":
+                 {
+                     "snapshot-id": 3055729675574597004,
+                     "statistics-path": "s3://a/b/stats.puffin",
+                     "file-size-in-bytes": 413,
+                     "file-footer-size-in-bytes": 42,
+                     "blob-metadata": [
+                         {
+                             "type": "apache-datasketches-theta-v1",
+                             "snapshot-id": 3055729675574597004,
+                             "sequence-number": 1,
+                             "fields": [1]
+                         }
+                     ]
+                 }
+        }
+    """
+
+    update_with_json = SetStatisticsUpdate.model_validate_json(update_json)
+    assert model_roundtrips(update_with_json)
+    assert update_with_json.snapshot_id == snapshot_id
+
+
 def test_remove_statistics_update(table_v2_with_statistics: Table) -> None:
     update = RemoveStatisticsUpdate(
         snapshot_id=3055729675574597004,
@@ -1371,13 +1823,17 @@ def test_set_partition_statistics_update(table_v2_with_statistics: Table) -> Non
 
     partition_statistics_file = PartitionStatisticsFile(
         snapshot_id=snapshot_id,
-        statistics_path="s3://bucket/warehouse/stats.puffin",
+        statistics_path="s3://bucket/warehouse/stats.parquet",
         file_size_in_bytes=124,
     )
 
     update = SetPartitionStatisticsUpdate(
         partition_statistics=partition_statistics_file,
     )
+
+    # Verify that serialization uses 'partition-statistics' alias
+    dumped_with_alias = update.model_dump(by_alias=True)
+    assert "partition-statistics" in dumped_with_alias
 
     new_metadata = update_table_metadata(
         table_v2_with_statistics.metadata,
@@ -1387,7 +1843,7 @@ def test_set_partition_statistics_update(table_v2_with_statistics: Table) -> Non
     expected = """
     {
       "snapshot-id": 3055729675574597004,
-      "statistics-path": "s3://bucket/warehouse/stats.puffin",
+      "statistics-path": "s3://bucket/warehouse/stats.parquet",
       "file-size-in-bytes": 124
     }"""
 
@@ -1405,7 +1861,7 @@ def test_remove_partition_statistics_update(table_v2_with_statistics: Table) -> 
 
     partition_statistics_file = PartitionStatisticsFile(
         snapshot_id=snapshot_id,
-        statistics_path="s3://bucket/warehouse/stats.puffin",
+        statistics_path="s3://bucket/warehouse/stats.parquet",
         file_size_in_bytes=124,
     )
 
@@ -1440,3 +1896,143 @@ def test_remove_partition_statistics_update_with_invalid_snapshot_id(table_v2_wi
             table_v2_with_statistics.metadata,
             (RemovePartitionStatisticsUpdate(snapshot_id=123456789),),
         )
+
+
+def test_add_snapshot_update_fails_without_first_row_id(table_v3: Table) -> None:
+    new_snapshot = Snapshot(
+        snapshot_id=25,
+        parent_snapshot_id=19,
+        sequence_number=200,
+        timestamp_ms=1602638593590,
+        manifest_list="s3:/a/b/c.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=3,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Cannot add snapshot without first row id",
+    ):
+        update_table_metadata(table_v3.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
+
+
+def test_add_snapshot_update_fails_with_smaller_first_row_id(table_v3: Table) -> None:
+    new_snapshot = Snapshot(
+        snapshot_id=25,
+        parent_snapshot_id=19,
+        sequence_number=200,
+        timestamp_ms=1602638593590,
+        manifest_list="s3:/a/b/c.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=3,
+        first_row_id=0,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Cannot add a snapshot with first row id smaller than the table's next-row-id",
+    ):
+        update_table_metadata(table_v3.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
+
+
+def test_add_snapshot_update_updates_next_row_id(table_v3: Table) -> None:
+    new_snapshot = Snapshot(
+        snapshot_id=25,
+        parent_snapshot_id=19,
+        sequence_number=200,
+        timestamp_ms=1602638593590,
+        manifest_list="s3:/a/b/c.avro",
+        summary=Summary(Operation.APPEND),
+        schema_id=3,
+        first_row_id=2,
+        added_rows=10,
+    )
+
+    new_metadata = update_table_metadata(table_v3.metadata, (AddSnapshotUpdate(snapshot=new_snapshot),))
+    assert new_metadata.next_row_id == 11
+
+
+def model_roundtrips(model: BaseModel) -> bool:
+    """Helper assertion that tests if a pydantic model roundtrips
+    successfully.
+    """
+    __tracebackhide__ = True
+    model_data = model.model_dump()
+    if model != type(model).model_validate(model_data):
+        pytest.fail(f"model {type(model)} did not roundtrip successfully")
+    return True
+
+
+def test_check_uuid_raises_when_mismatch(table_v2: Table, example_table_metadata_v2: dict[str, Any]) -> None:
+    different_uuid = "550e8400-e29b-41d4-a716-446655440000"
+    metadata_with_different_uuid = {**example_table_metadata_v2, "table-uuid": different_uuid}
+    new_metadata = TableMetadataV2(**metadata_with_different_uuid)
+
+    with pytest.raises(ValueError) as exc_info:
+        Table._check_uuid(table_v2.metadata, new_metadata)
+
+    assert "Table UUID does not match" in str(exc_info.value)
+    assert different_uuid in str(exc_info.value)
+
+
+def test_check_uuid_passes_when_match(table_v2: Table, example_table_metadata_v2: dict[str, Any]) -> None:
+    new_metadata = TableMetadataV2(**example_table_metadata_v2)
+    # Should not raise with same uuid
+    Table._check_uuid(table_v2.metadata, new_metadata)
+
+
+def test_build_large_partition_predicate(table_v2: Table) -> None:
+    with table_v2.transaction() as tx:
+        schema = table_v2.schema()
+        spec = table_v2.spec()
+        expr = tx._build_partition_predicate(
+            partition_records={Record(i) for i in range(5000)},
+            partition_fields=[(schema.find_field(field.source_id).name) for field in spec.fields],
+        )
+
+    bind(table_v2.metadata.schema(), expr, case_sensitive=True)
+
+
+def test_overwrite_delete_data_file_on_bucket_partition(catalog: Catalog) -> None:
+    """Delete a data file without projecting its already-transformed partition value again."""
+    import pyarrow as pa
+
+    from pyiceberg.io.pyarrow import schema_to_pyarrow
+
+    catalog.create_namespace("default")
+    schema = Schema(
+        NestedField(1, "tenant_id", StringType(), required=False),
+        NestedField(2, "value", IntegerType(), required=False),
+    )
+    spec = PartitionSpec(PartitionField(source_id=1, field_id=1000, transform=BucketTransform(8), name="tenant_id_bucket"))
+    table = catalog.create_table("default.bucket_file_delete", schema=schema, partition_spec=spec)
+
+    table.append(pa.Table.from_pylist([{"tenant_id": "tenant-a", "value": 1}], schema=schema_to_pyarrow(schema)))
+    data_file = next(iter(table.scan().plan_files())).file
+
+    with table.transaction() as transaction:
+        with transaction.update_snapshot().overwrite() as overwrite:
+            overwrite.delete_data_file(data_file)
+
+    assert table.scan().to_arrow().num_rows == 0
+
+
+def test_static_table_forwards_location_to_table_file_io(metadata_location: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen_locations: list[str | None] = []
+    real_load_file_io = load_file_io
+
+    def _spy(*args: Any, **kwargs: Any) -> FileIO:
+        if "location" in kwargs:
+            seen_locations.append(kwargs["location"])
+        elif len(args) >= 2:
+            seen_locations.append(args[1])
+        else:
+            seen_locations.append(None)
+        return real_load_file_io(*args, **kwargs)
+
+    monkeypatch.setattr("pyiceberg.table.load_file_io", _spy)
+
+    StaticTable.from_metadata(metadata_location)
+
+    assert seen_locations, "expected at least one load_file_io call"
+    assert all(loc is not None for loc in seen_locations), f"load_file_io called without a location: {seen_locations}"

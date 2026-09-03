@@ -18,11 +18,11 @@
 import base64
 import copy
 import struct
+import sys
 import threading
 import uuid
 from collections.abc import Generator
 from copy import deepcopy
-from typing import Optional
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -204,6 +204,7 @@ class SaslServer(threading.Thread):
         self._response = response
         self._port = None
         self._port_bound = threading.Event()
+        self._clients: list[thrift.transport.TSocket.TSocket] = []  # Track accepted client connections
 
     def run(self) -> None:
         self._socket.listen()
@@ -222,18 +223,28 @@ class SaslServer(threading.Thread):
             try:
                 client = self._socket.accept()
                 if client:
+                    self._clients.append(client)  # Track the client
                     client.write(self._response)
                     client.flush()
             except Exception:
-                pass
+                break
 
     @property
-    def port(self) -> Optional[int]:
+    def port(self) -> int | None:
         self._port_bound.wait()
         return self._port
 
     def close(self) -> None:
-        self._socket.close()
+        try:
+            self._socket.close()
+        except Exception:
+            pass
+        self.join(timeout=5)
+        for client in self._clients:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 @pytest.fixture(scope="session")
@@ -290,7 +301,7 @@ def test_create_table(
     # it to construct the assert_called_with
     metadata_location: str = called_hive_table.parameters["metadata_location"]
     assert metadata_location.endswith(".metadata.json")
-    assert "/database/table/metadata/" in metadata_location
+    assert "/database/table/metadata/" in metadata_location.replace("\\", "/")
     catalog._client.__enter__().create_table.assert_called_with(
         HiveTable(
             tableName="table",
@@ -471,7 +482,7 @@ def test_create_table_with_given_location_removes_trailing_slash(
     # it to construct the assert_called_with
     metadata_location: str = called_hive_table.parameters["metadata_location"]
     assert metadata_location.endswith(".metadata.json")
-    assert "/database/table-given-location/metadata/" in metadata_location
+    assert "/database/table-given-location/metadata/" in metadata_location.replace("\\", "/")
     catalog._client.__enter__().create_table.assert_called_with(
         HiveTable(
             tableName="table",
@@ -963,7 +974,10 @@ def test_rename_table_to_namespace_does_not_exists() -> None:
 
     catalog._client = MagicMock()
     catalog._client.__enter__().alter_table_with_environment_context.side_effect = InvalidOperationException(
-        message="Unable to change partition or table. Database default does not exist Check metastore logs for detailed stack.does_not_exists"
+        message=(
+            "Unable to change partition or table. Database default does not exist "
+            "Check metastore logs for detailed stack.does_not_exists"
+        )
     )
 
     with pytest.raises(NoSuchNamespaceError) as exc_info:
@@ -1304,8 +1318,8 @@ def test_hive_wait_for_lock() -> None:
     assert catalog._client.check_lock.call_count == 3
 
     # lock wait should exit with WaitingForLockException finally after enough retries
+    catalog._client.check_lock.reset_mock()
     catalog._client.check_lock.side_effect = [waiting for _ in range(10)]
-    catalog._client.check_lock.call_count = 0
     with pytest.raises(WaitingForLockException):
         catalog._wait_for_lock("db", "tbl", lockid, catalog._client)
     assert catalog._client.check_lock.call_count == 5
@@ -1356,6 +1370,7 @@ def test_create_hive_client_failure() -> None:
         assert mock_hive_client.call_count == 2
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Kerberos/puresasl not available on Windows")
 def test_create_hive_client_with_kerberos(
     kerberized_hive_metastore_fake_url: str,
 ) -> None:
@@ -1368,6 +1383,7 @@ def test_create_hive_client_with_kerberos(
     assert client is not None
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Kerberos/puresasl not available on Windows")
 def test_create_hive_client_with_kerberos_using_context_manager(
     kerberized_hive_metastore_fake_url: str,
 ) -> None:
@@ -1392,7 +1408,40 @@ def test_create_hive_client_with_kerberos_using_context_manager(
         with client as open_client:
             assert open_client._iprot.trans.isOpen()
 
+        assert not open_client._iprot.trans.isOpen()
         # Use the context manager a second time to see if
         # closing and re-opening work as expected.
         with client as open_client:
             assert open_client._iprot.trans.isOpen()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Kerberos/puresasl not available on Windows")
+def test_kerberized_client_uses_fresh_transport_on_reuse(
+    kerberized_hive_metastore_fake_url: str,
+) -> None:
+    """Reusing the context manager must reinitialize the transport."""
+    client = _HiveClient(
+        uri=kerberized_hive_metastore_fake_url,
+        kerberos_auth=True,
+    )
+    with (
+        patch(
+            "puresasl.mechanisms.kerberos.authGSSClientStep",
+            return_value=None,
+        ),
+        patch(
+            "puresasl.mechanisms.kerberos.authGSSClientResponse",
+            return_value=base64.b64encode(b"Some Response"),
+        ),
+        patch(
+            "puresasl.mechanisms.GSSAPIMechanism.complete",
+            return_value=True,
+        ),
+    ):
+        with client:
+            first_transport_id = id(client._transport)
+
+        with client:
+            second_transport_id = id(client._transport)
+
+        assert first_transport_id != second_transport_id

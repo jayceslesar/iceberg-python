@@ -30,6 +30,7 @@ This guide outlines the process for releasing PyIceberg in accordance with the [
 ## Requirements
 
 * A GPG key must be registered and published in the [Apache Iceberg KEYS file](https://downloads.apache.org/iceberg/KEYS). Follow [the instructions for setting up a GPG key and uploading it to the KEYS file](#set-up-gpg-key-and-upload-to-apache-iceberg-keys-file).
+    * Permission to update the `KEYS` artifact in the [Apache release distribution](https://dist.apache.org/repos/dist/release/iceberg/) (requires Iceberg PMC privileges).
 * SVN Access
     * Permission to upload artifacts to the [Apache development distribution](https://dist.apache.org/repos/dist/dev/iceberg/) (requires Apache Committer access).
     * Permission to upload artifacts to the [Apache release distribution](https://dist.apache.org/repos/dist/release/iceberg/) (requires Apache PMC access).
@@ -66,7 +67,7 @@ deprecation_message(
 
 ### Update Library Version
 
-Update the version in `pyproject.toml` and `pyiceberg/__init__.py` to match the release version. See [#1276](https://github.com/apache/iceberg-python/pull/1276).
+Update the release version by running `uv version <release-version>`, which updates both `pyproject.toml` and `uv.lock`. Then update the version in `pyiceberg/__init__.py` to match.
 
 ## Publishing a Release Candidate (RC)
 
@@ -95,6 +96,9 @@ git checkout -b pyiceberg-0.8.x pyiceberg-0.8.0
 
 # Cherry-pick commits for the upcoming patch release
 git cherry-pick <commit>
+
+# Push the new branch
+git push git@github.com:apache/iceberg-python.git pyiceberg-0.8.x
 ```
 
 ### Create Tag
@@ -133,7 +137,11 @@ This action will generate two final artifacts:
 If `gh` is available, watch the GitHub Action progress using:
 
 ```bash
+: "${GIT_TAG:?ERROR: GIT_TAG is not set or is empty}"
+
 RUN_ID=$(gh run list --repo apache/iceberg-python --workflow "Python Build Release Candidate" --branch "${GIT_TAG}" --event push --json databaseId -q '.[0].databaseId')
+: "${RUN_ID:?ERROR: RUN_ID could not be determined}"
+
 echo "Waiting for workflow to complete, this will take several minutes..."
 gh run watch $RUN_ID --repo apache/iceberg-python
 ```
@@ -141,6 +149,8 @@ gh run watch $RUN_ID --repo apache/iceberg-python
 and download the artifacts using:
 
 ```bash
+: "${RUN_ID:?ERROR: RUN_ID is not set or is empty}"
+
 gh run download $RUN_ID --repo apache/iceberg-python
 ```
 
@@ -158,6 +168,9 @@ Navigate to the artifact directory. Generate signature and checksum files:
 * `.sha512` files: SHA-512 checksums for verifying file integrity.
 
 ```bash
+: "${VERSION:?ERROR: VERSION is not set or is empty}"
+: "${RC:?ERROR: RC is not set or is empty}"
+
 (
     cd svn-release-candidate-${VERSION}rc${RC}
 
@@ -176,14 +189,11 @@ The parentheses `()` create a subshell. Any changes to the directory (`cd`) are 
 Now, upload the files from the same directory:
 
 ```bash
-export SVN_TMP_DIR=/tmp/iceberg-${VERSION}/
-svn checkout https://dist.apache.org/repos/dist/dev/iceberg $SVN_TMP_DIR
+: "${VERSION:?ERROR: VERSION is not set or is empty}"
+: "${VERSION_WITH_RC:?ERROR: VERSION_WITH_RC is not set or is empty}"
+: "${RC:?ERROR: RC is not set or is empty}"
 
-export SVN_TMP_DIR_VERSIONED=${SVN_TMP_DIR}pyiceberg-$VERSION_WITH_RC/
-mkdir -p $SVN_TMP_DIR_VERSIONED
-cp svn-release-candidate-${VERSION}rc${RC}/* $SVN_TMP_DIR_VERSIONED
-svn add $SVN_TMP_DIR_VERSIONED
-svn ci -m "PyIceberg ${VERSION_WITH_RC}" ${SVN_TMP_DIR_VERSIONED}
+svn import "svn-release-candidate-${VERSION}rc${RC}" "https://dist.apache.org/repos/dist/dev/iceberg/pyiceberg-${VERSION_WITH_RC}" -m "PyIceberg ${VERSION_WITH_RC}"
 ```
 
 Verify the artifact is uploaded to [https://dist.apache.org/repos/dist/dev/iceberg](https://dist.apache.org/repos/dist/dev/iceberg/).
@@ -214,6 +224,9 @@ Update the artifact directory to PyPi using `twine`. This **won't** bump the ver
 <!-- prettier-ignore-end -->
 
 ```bash
+: "${VERSION:?ERROR: VERSION is not set or is empty}"
+: "${RC:?ERROR: RC is not set or is empty}"
+
 twine upload pypi-release-candidate-${VERSION}rc${RC}/*
 ```
 
@@ -226,6 +239,10 @@ Verify the artifact is uploaded to [PyPi](https://pypi.org/project/pyiceberg/#hi
 Final step is to generate the email to the dev mail list:
 
 ```bash
+: "${GIT_TAG:?ERROR: GIT_TAG is not set or is empty}"
+: "${VERSION:?ERROR: VERSION is not set or is empty}"
+: "${VERSION_WITH_RC:?ERROR: VERSION_WITH_RC is not set or is empty}"
+
 export GIT_TAG_REF=$(git show-ref ${GIT_TAG})
 export GIT_TAG_HASH=${GIT_TAG_REF:0:40}
 export LAST_COMMIT_ID=$(git rev-list ${GIT_TAG} 2> /dev/null | head -n 1)
@@ -308,6 +325,9 @@ Kind regards,
 <!-- prettier-ignore-end -->
 
 ```bash
+: "${VERSION_WITH_RC:?ERROR: VERSION_WITH_RC is not set or is empty}"
+: "${VERSION:?ERROR: VERSION is not set or is empty}"
+
 export SVN_DEV_DIR_VERSIONED="https://dist.apache.org/repos/dist/dev/iceberg/pyiceberg-${VERSION_WITH_RC}"
 export SVN_RELEASE_DIR_VERSIONED="https://dist.apache.org/repos/dist/release/iceberg/pyiceberg-${VERSION}"
 
@@ -336,8 +356,12 @@ The latest version can be pushed to PyPi. Check out the Apache SVN and make sure
 <!-- prettier-ignore-end -->
 
 ```bash
-svn checkout https://dist.apache.org/repos/dist/release/iceberg /tmp/iceberg-dist-release/
+: "${VERSION:?ERROR: VERSION is not set or is empty}"
+
+svn checkout https://dist.apache.org/repos/dist/release/iceberg/pyiceberg-${VERSION} /tmp/iceberg-dist-release/pyiceberg-${VERSION}
+
 cd /tmp/iceberg-dist-release/pyiceberg-${VERSION}
+
 twine upload pyiceberg-*.whl pyiceberg-*.tar.gz
 ```
 
@@ -389,10 +413,6 @@ Run the [`Release Docs` Github Action](https://github.com/apache/iceberg-python/
 
 Make sure to create a PR to update the [GitHub issues template](https://github.com/apache/iceberg-python/blob/main/.github/ISSUE_TEMPLATE/iceberg_bug_report.yml) with the latest version.
 
-### Update the integration tests
-
-Ensure to update the `PYICEBERG_VERSION` in the [Dockerfile](https://github.com/apache/iceberg-python/blob/main/dev/Dockerfile).
-
 ## Misc
 
 ### Set up GPG key and Upload to Apache Iceberg KEYS file
@@ -409,5 +429,12 @@ cd icebergsvn
 echo "" >> KEYS # append a newline
 gpg --list-sigs <YOUR KEY ID HERE> >> KEYS # append signatures
 gpg --armor --export <YOUR KEY ID HERE> >> KEYS # append public key block
-svn commit -m "add key for <YOUR NAME HERE>"
+svn commit -m "add key for <YOUR NAME HERE>" # this requires Iceberg PMC privileges
 ```
+
+<!-- prettier-ignore-start -->
+
+!!! note
+    Updating the `KEYS` artifact in the `release/` distribution requires Iceberg PMC privileges. Please work with a PMC member to update the file.
+
+<!-- prettier-ignore-end -->

@@ -21,7 +21,8 @@ import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
 from functools import singledispatch
-from typing import TYPE_CHECKING, Annotated, Any, Dict, Generic, List, Literal, Optional, Tuple, TypeVar, Union, cast
+from types import TracebackType
+from typing import TYPE_CHECKING, Annotated, Any, Generic, Literal, TypeVar, cast
 
 from pydantic import Field, field_validator, model_serializer, model_validator
 
@@ -71,9 +72,10 @@ class UpdateTableMetadata(ABC, Generic[U]):
     def commit(self) -> None:
         self._transaction._apply(*self._commit())
 
-    def __exit__(self, _: Any, value: Any, traceback: Any) -> None:
-        """Close and commit the change."""
-        self.commit()
+    def __exit__(self, exctype: type[BaseException] | None, excinst: BaseException | None, exctb: TracebackType | None) -> None:
+        """Close and commit the change if no exceptions have been raised."""
+        if exctype is None and excinst is None and exctb is None:
+            self.commit()
 
     def __enter__(self) -> U:
         """Update the table."""
@@ -136,14 +138,14 @@ class SetSnapshotRefUpdate(IcebergBaseModel):
     ref_name: str = Field(alias="ref-name")
     type: Literal[SnapshotRefType.TAG, SnapshotRefType.BRANCH]
     snapshot_id: int = Field(alias="snapshot-id")
-    max_ref_age_ms: Annotated[Optional[int], Field(alias="max-ref-age-ms", default=None)]
-    max_snapshot_age_ms: Annotated[Optional[int], Field(alias="max-snapshot-age-ms", default=None)]
-    min_snapshots_to_keep: Annotated[Optional[int], Field(alias="min-snapshots-to-keep", default=None)]
+    max_ref_age_ms: Annotated[int | None, Field(alias="max-ref-age-ms", default=None)]
+    max_snapshot_age_ms: Annotated[int | None, Field(alias="max-snapshot-age-ms", default=None)]
+    min_snapshots_to_keep: Annotated[int | None, Field(alias="min-snapshots-to-keep", default=None)]
 
 
 class RemoveSnapshotsUpdate(IcebergBaseModel):
     action: Literal["remove-snapshots"] = Field(default="remove-snapshots")
-    snapshot_ids: List[int] = Field(alias="snapshot-ids")
+    snapshot_ids: list[int] = Field(alias="snapshot-ids")
 
 
 class RemoveSnapshotRefUpdate(IcebergBaseModel):
@@ -158,32 +160,39 @@ class SetLocationUpdate(IcebergBaseModel):
 
 class SetPropertiesUpdate(IcebergBaseModel):
     action: Literal["set-properties"] = Field(default="set-properties")
-    updates: Dict[str, str]
+    updates: dict[str, str]
 
     @field_validator("updates", mode="before")
-    def transform_properties_dict_value_to_str(cls, properties: Properties) -> Dict[str, str]:
+    def transform_properties_dict_value_to_str(cls, properties: Properties) -> dict[str, str]:
         return transform_dict_value_to_str(properties)
 
 
 class RemovePropertiesUpdate(IcebergBaseModel):
     action: Literal["remove-properties"] = Field(default="remove-properties")
-    removals: List[str]
+    removals: list[str]
 
 
 class SetStatisticsUpdate(IcebergBaseModel):
     action: Literal["set-statistics"] = Field(default="set-statistics")
     statistics: StatisticsFile
-    snapshot_id: Optional[int] = Field(
+    snapshot_id: int | None = Field(
         None,
         alias="snapshot-id",
-        description="snapshot-id is **DEPRECATED for REMOVAL** since it contains redundant information. Use `statistics.snapshot-id` field instead.",
+        description="snapshot-id is **DEPRECATED for REMOVAL** since it contains redundant information. "
+        "Use `statistics.snapshot-id` field instead.",
     )
 
     @model_validator(mode="before")
-    def validate_snapshot_id(cls, data: Dict[str, Any]) -> Dict[str, Any]:
-        stats = cast(StatisticsFile, data["statistics"])
+    def validate_snapshot_id(cls, data: dict[str, Any]) -> dict[str, Any]:
+        stats = data["statistics"]
+        if isinstance(stats, StatisticsFile):
+            snapshot_id = stats.snapshot_id
+        elif isinstance(stats, dict):
+            snapshot_id = cast(int, stats.get("snapshot-id"))
+        else:
+            snapshot_id = None
 
-        data["snapshot_id"] = stats.snapshot_id
+        data["snapshot_id"] = snapshot_id
 
         return data
 
@@ -193,9 +202,19 @@ class RemoveStatisticsUpdate(IcebergBaseModel):
     snapshot_id: int = Field(alias="snapshot-id")
 
 
+class RemovePartitionSpecsUpdate(IcebergBaseModel):
+    action: Literal["remove-partition-specs"] = Field(default="remove-partition-specs")
+    spec_ids: list[int] = Field(alias="spec-ids")
+
+
+class RemoveSchemasUpdate(IcebergBaseModel):
+    action: Literal["remove-schemas"] = Field(default="remove-schemas")
+    schema_ids: list[int] = Field(alias="schema-ids")
+
+
 class SetPartitionStatisticsUpdate(IcebergBaseModel):
     action: Literal["set-partition-statistics"] = Field(default="set-partition-statistics")
-    partition_statistics: PartitionStatisticsFile
+    partition_statistics: PartitionStatisticsFile = Field(alias="partition-statistics")
 
 
 class RemovePartitionStatisticsUpdate(IcebergBaseModel):
@@ -204,33 +223,33 @@ class RemovePartitionStatisticsUpdate(IcebergBaseModel):
 
 
 TableUpdate = Annotated[
-    Union[
-        AssignUUIDUpdate,
-        UpgradeFormatVersionUpdate,
-        AddSchemaUpdate,
-        SetCurrentSchemaUpdate,
-        AddPartitionSpecUpdate,
-        SetDefaultSpecUpdate,
-        AddSortOrderUpdate,
-        SetDefaultSortOrderUpdate,
-        AddSnapshotUpdate,
-        SetSnapshotRefUpdate,
-        RemoveSnapshotsUpdate,
-        RemoveSnapshotRefUpdate,
-        SetLocationUpdate,
-        SetPropertiesUpdate,
-        RemovePropertiesUpdate,
-        SetStatisticsUpdate,
-        RemoveStatisticsUpdate,
-        SetPartitionStatisticsUpdate,
-        RemovePartitionStatisticsUpdate,
-    ],
+    AssignUUIDUpdate
+    | UpgradeFormatVersionUpdate
+    | AddSchemaUpdate
+    | SetCurrentSchemaUpdate
+    | AddPartitionSpecUpdate
+    | SetDefaultSpecUpdate
+    | AddSortOrderUpdate
+    | SetDefaultSortOrderUpdate
+    | AddSnapshotUpdate
+    | SetSnapshotRefUpdate
+    | RemoveSnapshotsUpdate
+    | RemoveSnapshotRefUpdate
+    | SetLocationUpdate
+    | SetPropertiesUpdate
+    | RemovePropertiesUpdate
+    | SetStatisticsUpdate
+    | RemoveStatisticsUpdate
+    | RemovePartitionSpecsUpdate
+    | RemoveSchemasUpdate
+    | SetPartitionStatisticsUpdate
+    | RemovePartitionStatisticsUpdate,
     Field(discriminator="action"),
 ]
 
 
 class _TableMetadataUpdateContext:
-    _updates: List[TableUpdate]
+    _updates: list[TableUpdate]
 
     def __init__(self) -> None:
         self._updates = []
@@ -335,7 +354,7 @@ def _(update: RemovePropertiesUpdate, base_metadata: TableMetadata, context: _Ta
 
 @_apply_table_update.register(AddSchemaUpdate)
 def _(update: AddSchemaUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
-    metadata_updates: Dict[str, Any] = {
+    metadata_updates: dict[str, Any] = {
         "last_column_id": max(base_metadata.last_column_id, update.schema_.highest_field_id),
         "schemas": base_metadata.schemas + [update.schema_],
     }
@@ -371,7 +390,7 @@ def _(update: AddPartitionSpecUpdate, base_metadata: TableMetadata, context: _Ta
         if spec.spec_id == update.spec.spec_id and spec != update.spec:
             raise ValueError(f"Partition spec with id {spec.spec_id} already exists: {spec}")
 
-    metadata_updates: Dict[str, Any] = {
+    metadata_updates: dict[str, Any] = {
         "partition_specs": base_metadata.partition_specs + [update.spec],
         "last_partition_id": max(
             max([field.field_id for field in update.spec.fields], default=0),
@@ -425,6 +444,18 @@ def _(update: AddSnapshotUpdate, base_metadata: TableMetadata, context: _TableMe
             f"Cannot add snapshot with sequence number {update.snapshot.sequence_number} "
             f"older than last sequence number {base_metadata.last_sequence_number}"
         )
+    elif base_metadata.format_version >= 3 and update.snapshot.first_row_id is None:
+        raise ValueError("Cannot add snapshot without first row id")
+    elif (
+        base_metadata.format_version >= 3
+        and update.snapshot.first_row_id is not None
+        and base_metadata.next_row_id is not None
+        and update.snapshot.first_row_id < base_metadata.next_row_id
+    ):
+        raise ValueError(
+            f"Cannot add a snapshot with first row id smaller than the table's next-row-id "
+            f"{update.snapshot.first_row_id} < {base_metadata.next_row_id}"
+        )
 
     context.add_update(update)
     return base_metadata.model_copy(
@@ -432,6 +463,11 @@ def _(update: AddSnapshotUpdate, base_metadata: TableMetadata, context: _TableMe
             "last_updated_ms": update.snapshot.timestamp_ms,
             "last_sequence_number": update.snapshot.sequence_number,
             "snapshots": base_metadata.snapshots + [update.snapshot],
+            "next_row_id": base_metadata.next_row_id + update.snapshot.added_rows
+            if base_metadata.format_version >= 3
+            and base_metadata.next_row_id is not None
+            and update.snapshot.added_rows is not None
+            else None,
         }
     )
 
@@ -454,7 +490,7 @@ def _(update: SetSnapshotRefUpdate, base_metadata: TableMetadata, context: _Tabl
     if snapshot is None:
         raise ValueError(f"Cannot set {update.ref_name} to unknown snapshot {snapshot_ref.snapshot_id}")
 
-    metadata_updates: Dict[str, Any] = {}
+    metadata_updates: dict[str, Any] = {}
     if context.is_added_snapshot(snapshot_ref.snapshot_id):
         metadata_updates["last_updated_ms"] = snapshot.timestamp_ms
 
@@ -502,7 +538,7 @@ def _(update: RemoveSnapshotsUpdate, base_metadata: TableMetadata, context: _Tab
         if ref.snapshot_id in update.snapshot_ids
     )
     remove_statistics_updates = (
-        RemoveStatisticsUpdate(statistics_file.snapshot_id)
+        RemoveStatisticsUpdate(snapshot_id=statistics_file.snapshot_id)
         for statistics_file in base_metadata.statistics
         if statistics_file.snapshot_id in update.snapshot_ids
     )
@@ -589,6 +625,38 @@ def _(update: RemoveStatisticsUpdate, base_metadata: TableMetadata, context: _Ta
     return base_metadata.model_copy(update={"statistics": statistics})
 
 
+@_apply_table_update.register(RemovePartitionSpecsUpdate)
+def _(update: RemovePartitionSpecsUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+    for remove_spec_id in update.spec_ids:
+        if not any(spec.spec_id == remove_spec_id for spec in base_metadata.partition_specs):
+            raise ValueError(f"Partition spec with id {remove_spec_id} does not exist")
+
+    if base_metadata.default_spec_id in update.spec_ids:
+        raise ValueError(f"Cannot remove default partition spec: {base_metadata.default_spec_id}")
+
+    partition_specs = [spec for spec in base_metadata.partition_specs if spec.spec_id not in update.spec_ids]
+
+    context.add_update(update)
+    return base_metadata.model_copy(update={"partition_specs": partition_specs})
+
+
+@_apply_table_update.register(RemoveSchemasUpdate)
+def _(update: RemoveSchemasUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
+    # This method should error if any schemas do not exist.
+    # It should error if the default schema is being removed.
+    # Otherwise, remove the schemas listed in update.schema_ids.
+    for remove_schema_id in update.schema_ids:
+        if not any(schema.schema_id == remove_schema_id for schema in base_metadata.schemas):
+            raise ValueError(f"Schema with schema id {remove_schema_id} does not exist")
+        if base_metadata.current_schema_id == remove_schema_id:
+            raise ValueError(f"Cannot remove current schema with id {remove_schema_id}")
+
+    schemas = [schema for schema in base_metadata.schemas if schema.schema_id not in update.schema_ids]
+    context.add_update(update)
+
+    return base_metadata.model_copy(update={"schemas": schemas})
+
+
 @_apply_table_update.register(SetPartitionStatisticsUpdate)
 def _(update: SetPartitionStatisticsUpdate, base_metadata: TableMetadata, context: _TableMetadataUpdateContext) -> TableMetadata:
     partition_statistics = filter_statistics_by_snapshot_id(
@@ -614,9 +682,9 @@ def _(
 
 def update_table_metadata(
     base_metadata: TableMetadata,
-    updates: Tuple[TableUpdate, ...],
+    updates: tuple[TableUpdate, ...],
     enforce_validation: bool = False,
-    metadata_location: Optional[str] = None,
+    metadata_location: str | None = None,
 ) -> TableMetadata:
     """Update the table metadata with the given updates in one transaction.
 
@@ -641,6 +709,10 @@ def update_table_metadata(
             new_metadata = _update_table_metadata_log(new_metadata, metadata_location, base_metadata.last_updated_ms)
         if base_metadata.last_updated_ms == new_metadata.last_updated_ms:
             new_metadata = new_metadata.model_copy(update={"last_updated_ms": datetime_to_millis(datetime.now().astimezone())})
+
+    # Check correctness of partition spec, and sort order
+    new_metadata.spec().check_compatible(new_metadata.schema())
+    new_metadata.sort_order().check_compatible(new_metadata.schema())
 
     if enforce_validation:
         return TableMetadataUtil.parse_obj(new_metadata.model_dump())
@@ -674,7 +746,7 @@ def _update_table_metadata_log(base_metadata: TableMetadata, metadata_location: 
     if len(base_metadata.metadata_log) >= max_metadata_log_entries:  # type: ignore
         remove_index = len(base_metadata.metadata_log) - max_metadata_log_entries + 1  # type: ignore
         previous_metadata_log = base_metadata.metadata_log[remove_index:]
-    metadata_updates: Dict[str, Any] = {
+    metadata_updates: dict[str, Any] = {
         "metadata_log": previous_metadata_log + [MetadataLogEntry(metadata_file=metadata_location, timestamp_ms=last_updated_ms)]
     }
     return base_metadata.model_copy(update=metadata_updates)
@@ -684,7 +756,7 @@ class ValidatableTableRequirement(IcebergBaseModel):
     type: str
 
     @abstractmethod
-    def validate(self, base_metadata: Optional[TableMetadata]) -> None:
+    def validate(self, base_metadata: TableMetadata | None) -> None:
         """Validate the requirement against the base metadata.
 
         Args:
@@ -701,7 +773,7 @@ class AssertCreate(ValidatableTableRequirement):
 
     type: Literal["assert-create"] = Field(default="assert-create")
 
-    def validate(self, base_metadata: Optional[TableMetadata]) -> None:
+    def validate(self, base_metadata: TableMetadata | None) -> None:
         if base_metadata is not None:
             raise CommitFailedException("Table already exists")
 
@@ -712,7 +784,7 @@ class AssertTableUUID(ValidatableTableRequirement):
     type: Literal["assert-table-uuid"] = Field(default="assert-table-uuid")
     uuid: uuid.UUID
 
-    def validate(self, base_metadata: Optional[TableMetadata]) -> None:
+    def validate(self, base_metadata: TableMetadata | None) -> None:
         if base_metadata is None:
             raise CommitFailedException("Requirement failed: current table metadata is missing")
         elif self.uuid != base_metadata.table_uuid:
@@ -727,7 +799,7 @@ class AssertRefSnapshotId(ValidatableTableRequirement):
 
     type: Literal["assert-ref-snapshot-id"] = Field(default="assert-ref-snapshot-id")
     ref: str = Field(...)
-    snapshot_id: Optional[int] = Field(default=None, alias="snapshot-id")
+    snapshot_id: int | None = Field(default=None, alias="snapshot-id")
 
     @model_serializer(mode="wrap")
     def serialize_model(self, handler: ModelWrapSerializerWithoutInfo) -> dict[str, Any]:
@@ -735,7 +807,7 @@ class AssertRefSnapshotId(ValidatableTableRequirement):
         # Ensure "snapshot-id" is always present, even if value is None
         return {**partial_result, "snapshot-id": self.snapshot_id}
 
-    def validate(self, base_metadata: Optional[TableMetadata]) -> None:
+    def validate(self, base_metadata: TableMetadata | None) -> None:
         if base_metadata is None:
             raise CommitFailedException("Requirement failed: current table metadata is missing")
         elif len(base_metadata.snapshots) == 0 and self.ref != MAIN_BRANCH:
@@ -748,7 +820,8 @@ class AssertRefSnapshotId(ValidatableTableRequirement):
                 raise CommitFailedException(f"Requirement failed: {ref_type} {self.ref} was created concurrently")
             elif self.snapshot_id != snapshot_ref.snapshot_id:
                 raise CommitFailedException(
-                    f"Requirement failed: {ref_type} {self.ref} has changed: expected id {self.snapshot_id}, found {snapshot_ref.snapshot_id}"
+                    f"Requirement failed: {ref_type} {self.ref} has changed: "
+                    f"expected id {self.snapshot_id}, found {snapshot_ref.snapshot_id}"
                 )
         elif self.snapshot_id is not None:
             raise CommitFailedException(f"Requirement failed: branch or tag {self.ref} is missing, expected {self.snapshot_id}")
@@ -760,12 +833,13 @@ class AssertLastAssignedFieldId(ValidatableTableRequirement):
     type: Literal["assert-last-assigned-field-id"] = Field(default="assert-last-assigned-field-id")
     last_assigned_field_id: int = Field(..., alias="last-assigned-field-id")
 
-    def validate(self, base_metadata: Optional[TableMetadata]) -> None:
+    def validate(self, base_metadata: TableMetadata | None) -> None:
         if base_metadata is None:
             raise CommitFailedException("Requirement failed: current table metadata is missing")
         elif base_metadata.last_column_id != self.last_assigned_field_id:
             raise CommitFailedException(
-                f"Requirement failed: last assigned field id has changed: expected {self.last_assigned_field_id}, found {base_metadata.last_column_id}"
+                f"Requirement failed: last assigned field id has changed: "
+                f"expected {self.last_assigned_field_id}, found {base_metadata.last_column_id}"
             )
 
 
@@ -775,12 +849,13 @@ class AssertCurrentSchemaId(ValidatableTableRequirement):
     type: Literal["assert-current-schema-id"] = Field(default="assert-current-schema-id")
     current_schema_id: int = Field(..., alias="current-schema-id")
 
-    def validate(self, base_metadata: Optional[TableMetadata]) -> None:
+    def validate(self, base_metadata: TableMetadata | None) -> None:
         if base_metadata is None:
             raise CommitFailedException("Requirement failed: current table metadata is missing")
         elif self.current_schema_id != base_metadata.current_schema_id:
             raise CommitFailedException(
-                f"Requirement failed: current schema id has changed: expected {self.current_schema_id}, found {base_metadata.current_schema_id}"
+                f"Requirement failed: current schema id has changed: "
+                f"expected {self.current_schema_id}, found {base_metadata.current_schema_id}"
             )
 
 
@@ -788,14 +863,15 @@ class AssertLastAssignedPartitionId(ValidatableTableRequirement):
     """The table's last assigned partition id must match the requirement's `last-assigned-partition-id`."""
 
     type: Literal["assert-last-assigned-partition-id"] = Field(default="assert-last-assigned-partition-id")
-    last_assigned_partition_id: Optional[int] = Field(..., alias="last-assigned-partition-id")
+    last_assigned_partition_id: int | None = Field(..., alias="last-assigned-partition-id")
 
-    def validate(self, base_metadata: Optional[TableMetadata]) -> None:
+    def validate(self, base_metadata: TableMetadata | None) -> None:
         if base_metadata is None:
             raise CommitFailedException("Requirement failed: current table metadata is missing")
         elif base_metadata.last_partition_id != self.last_assigned_partition_id:
             raise CommitFailedException(
-                f"Requirement failed: last assigned partition id has changed: expected {self.last_assigned_partition_id}, found {base_metadata.last_partition_id}"
+                f"Requirement failed: last assigned partition id has changed: "
+                f"expected {self.last_assigned_partition_id}, found {base_metadata.last_partition_id}"
             )
 
 
@@ -805,12 +881,13 @@ class AssertDefaultSpecId(ValidatableTableRequirement):
     type: Literal["assert-default-spec-id"] = Field(default="assert-default-spec-id")
     default_spec_id: int = Field(..., alias="default-spec-id")
 
-    def validate(self, base_metadata: Optional[TableMetadata]) -> None:
+    def validate(self, base_metadata: TableMetadata | None) -> None:
         if base_metadata is None:
             raise CommitFailedException("Requirement failed: current table metadata is missing")
         elif self.default_spec_id != base_metadata.default_spec_id:
             raise CommitFailedException(
-                f"Requirement failed: default spec id has changed: expected {self.default_spec_id}, found {base_metadata.default_spec_id}"
+                f"Requirement failed: default spec id has changed: "
+                f"expected {self.default_spec_id}, found {base_metadata.default_spec_id}"
             )
 
 
@@ -820,27 +897,26 @@ class AssertDefaultSortOrderId(ValidatableTableRequirement):
     type: Literal["assert-default-sort-order-id"] = Field(default="assert-default-sort-order-id")
     default_sort_order_id: int = Field(..., alias="default-sort-order-id")
 
-    def validate(self, base_metadata: Optional[TableMetadata]) -> None:
+    def validate(self, base_metadata: TableMetadata | None) -> None:
         if base_metadata is None:
             raise CommitFailedException("Requirement failed: current table metadata is missing")
         elif self.default_sort_order_id != base_metadata.default_sort_order_id:
             raise CommitFailedException(
-                f"Requirement failed: default sort order id has changed: expected {self.default_sort_order_id}, found {base_metadata.default_sort_order_id}"
+                f"Requirement failed: default sort order id has changed: "
+                f"expected {self.default_sort_order_id}, found {base_metadata.default_sort_order_id}"
             )
 
 
 TableRequirement = Annotated[
-    Union[
-        AssertCreate,
-        AssertTableUUID,
-        AssertRefSnapshotId,
-        AssertLastAssignedFieldId,
-        AssertCurrentSchemaId,
-        AssertLastAssignedPartitionId,
-        AssertDefaultSpecId,
-        AssertDefaultSortOrderId,
-    ],
+    AssertCreate
+    | AssertTableUUID
+    | AssertRefSnapshotId
+    | AssertLastAssignedFieldId
+    | AssertCurrentSchemaId
+    | AssertLastAssignedPartitionId
+    | AssertDefaultSpecId
+    | AssertDefaultSortOrderId,
     Field(discriminator="type"),
 ]
 
-UpdatesAndRequirements = Tuple[Tuple[TableUpdate, ...], Tuple[TableRequirement, ...]]
+UpdatesAndRequirements = tuple[tuple[TableUpdate, ...], tuple[TableRequirement, ...]]

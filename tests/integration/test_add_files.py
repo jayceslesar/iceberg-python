@@ -20,8 +20,8 @@ import multiprocessing
 import os
 import re
 import threading
+from collections.abc import Iterator
 from datetime import date
-from typing import Iterator
 from unittest import mock
 
 import pyarrow as pa
@@ -151,7 +151,7 @@ def _create_table(
 
 
 @pytest.fixture(name="format_version", params=[pytest.param(1, id="format_version=1"), pytest.param(2, id="format_version=2")])
-def format_version_fixure(request: pytest.FixtureRequest) -> Iterator[int]:
+def format_version_fixture(request: pytest.FixtureRequest) -> Iterator[int]:
     """Fixture to run tests with different table format versions."""
     yield request.param
 
@@ -216,14 +216,14 @@ def test_add_files_to_unpartitioned_table_raises_file_not_found(
 
 
 @pytest.mark.integration
-def test_add_files_to_unpartitioned_table_raises_has_field_ids(
+def test_add_files_to_unpartitioned_table_with_field_ids(
     spark: SparkSession, session_catalog: Catalog, format_version: int
 ) -> None:
-    identifier = f"default.unpartitioned_raises_field_ids_v{format_version}"
+    identifier = f"default.unpartitioned_with_field_ids_v{format_version}"
     tbl = _create_table(session_catalog, identifier, format_version)
 
-    file_paths = [f"s3://warehouse/default/unpartitioned_raises_field_ids/v{format_version}/test-{i}.parquet" for i in range(5)]
-    # write parquet files
+    file_paths = [f"s3://warehouse/default/unpartitioned_with_field_ids/v{format_version}/test-{i}.parquet" for i in range(5)]
+    # write parquet files with field IDs matching the table schema
     for file_path in file_paths:
         fo = tbl.io.new_output(file_path)
         with fo.create(overwrite=True) as fos:
@@ -231,8 +231,30 @@ def test_add_files_to_unpartitioned_table_raises_has_field_ids(
                 writer.write_table(ARROW_TABLE_WITH_IDS)
 
     # add the parquet files as data files
-    with pytest.raises(NotImplementedError):
-        tbl.add_files(file_paths=file_paths)
+    tbl.add_files(file_paths=file_paths)
+
+    # NameMapping should still be set even though files have field IDs
+    assert tbl.name_mapping() is not None
+
+    # Verify files were added successfully
+    rows = spark.sql(
+        f"""
+        SELECT added_data_files_count, existing_data_files_count, deleted_data_files_count
+        FROM {identifier}.all_manifests
+    """
+    ).collect()
+
+    assert [row.added_data_files_count for row in rows] == [5]
+    assert [row.existing_data_files_count for row in rows] == [0]
+    assert [row.deleted_data_files_count for row in rows] == [0]
+
+    # Verify data can be read back correctly
+    df = spark.table(identifier).toPandas()
+    assert len(df) == 5
+    assert all(df["foo"] == True)  # noqa: E712
+    assert all(df["bar"] == "bar_string")
+    assert all(df["baz"] == 123)
+    assert all(df["qux"] == date(2024, 3, 7))
 
 
 @pytest.mark.integration
@@ -448,8 +470,8 @@ def test_add_files_to_bucket_partitioned_table_fails(spark: SparkSession, sessio
     with pytest.raises(ValueError) as exc_info:
         tbl.add_files(file_paths=file_paths)
     assert (
-        "Cannot infer partition value from parquet metadata for a non-linear Partition Field: baz_bucket_3 with transform bucket[3]"
-        in str(exc_info.value)
+        "Cannot infer partition value from parquet metadata for a non-linear Partition Field: "
+        "baz_bucket_3 with transform bucket[3]" in str(exc_info.value)
     )
 
 
@@ -496,14 +518,14 @@ def test_add_files_to_partitioned_table_fails_with_lower_and_upper_mismatch(
     with pytest.raises(ValueError) as exc_info:
         tbl.add_files(file_paths=file_paths)
     assert (
-        "Cannot infer partition value from parquet metadata as there are more than one partition values for Partition Field: baz. lower_value=123, upper_value=124"
-        in str(exc_info.value)
+        "Cannot infer partition value from parquet metadata as there are more than one partition values "
+        "for Partition Field: baz. lower_value=123, upper_value=124" in str(exc_info.value)
     )
 
 
 @pytest.mark.integration
 def test_add_files_snapshot_properties(spark: SparkSession, session_catalog: Catalog, format_version: int) -> None:
-    identifier = f"default.unpartitioned_table_v{format_version}"
+    identifier = f"default.test_add_files_snapshot_properties_v{format_version}"
     tbl = _create_table(session_catalog, identifier, format_version)
 
     file_paths = [f"s3://warehouse/default/unpartitioned/v{format_version}/test-{i}.parquet" for i in range(5)]
@@ -573,6 +595,65 @@ def test_add_files_fails_on_schema_mismatch(spark: SparkSession, session_catalog
 │ ❌ │ 3: baz: optional int     │ 3: baz: optional string  │
 │ ✅ │ 4: qux: optional date    │ 4: qux: optional date    │
 └────┴──────────────────────────┴──────────────────────────┘
+"""
+
+    with pytest.raises(ValueError, match=expected):
+        tbl.add_files(file_paths=[file_path])
+
+
+@pytest.mark.integration
+def test_add_files_with_field_ids_fails_on_schema_mismatch(
+    spark: SparkSession, session_catalog: Catalog, format_version: int
+) -> None:
+    """Test that files with mismatched field types (when field IDs match) are rejected."""
+    identifier = f"default.table_schema_mismatch_based_on_field_ids__fails_v{format_version}"
+
+    tbl = _create_table(session_catalog, identifier, format_version)
+
+    # All fields are renamed and reordered but have matching field IDs, so they should be compatible
+    # except for 'baz' which has the wrong type
+    WRONG_SCHEMA = pa.schema(
+        [
+            pa.field("qux_", pa.date32(), metadata={"PARQUET:field_id": "4"}),
+            pa.field("baz_", pa.string(), metadata={"PARQUET:field_id": "3"}),  # Wrong type: should be int32
+            pa.field("bar_", pa.string(), metadata={"PARQUET:field_id": "2"}),
+            pa.field("foo_", pa.bool_(), metadata={"PARQUET:field_id": "1"}),
+        ]
+    )
+    file_path = f"s3://warehouse/default/table_with_field_ids_schema_mismatch_fails/v{format_version}/test.parquet"
+    # write parquet files
+    fo = tbl.io.new_output(file_path)
+    with fo.create(overwrite=True) as fos:
+        with pq.ParquetWriter(fos, schema=WRONG_SCHEMA) as writer:
+            writer.write_table(
+                pa.Table.from_pylist(
+                    [
+                        {
+                            "qux_": date(2024, 3, 7),
+                            "baz_": "123",
+                            "bar_": "bar_string",
+                            "foo_": True,
+                        },
+                        {
+                            "qux_": date(2024, 3, 7),
+                            "baz_": "124",
+                            "bar_": "bar_string",
+                            "foo_": True,
+                        },
+                    ],
+                    schema=WRONG_SCHEMA,
+                )
+            )
+
+    expected = """Mismatch in fields:
+┏━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃    ┃ Table field              ┃ Dataframe field           ┃
+┡━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ ✅ │ 1: foo: optional boolean │ 1: foo_: optional boolean │
+│ ✅ │ 2: bar: optional string  │ 2: bar_: optional string  │
+│ ❌ │ 3: baz: optional int     │ 3: baz_: optional string  │
+│ ✅ │ 4: qux: optional date    │ 4: qux_: optional date    │
+└────┴──────────────────────────┴───────────────────────────┘
 """
 
     with pytest.raises(ValueError, match=expected):
@@ -673,8 +754,8 @@ def test_add_files_with_timestamp_tz_ns_fails(session_catalog: Catalog, format_v
     exception_cause = exc_info.value.__cause__
     assert isinstance(exception_cause, TypeError)
     assert (
-        "Iceberg does not yet support 'ns' timestamp precision. Use 'downcast-ns-timestamp-to-us-on-write' configuration property to automatically downcast 'ns' to 'us' on write."
-        in exception_cause.args[0]
+        "Iceberg does not yet support 'ns' timestamp precision. Use 'downcast-ns-timestamp-to-us-on-write' "
+        "configuration property to automatically downcast 'ns' to 'us' on write." in exception_cause.args[0]
     )
 
 
@@ -713,7 +794,7 @@ def test_add_file_with_valid_nullability_diff(spark: SparkSession, session_catal
     rhs = written_arrow_table.to_pandas()
 
     for column in written_arrow_table.column_names:
-        for left, right in zip(lhs[column].to_list(), rhs[column].to_list()):
+        for left, right in zip(lhs[column].to_list(), rhs[column].to_list(), strict=True):
             assert left == right
 
 
@@ -755,7 +836,7 @@ def test_add_files_with_valid_upcast(
     rhs = written_arrow_table.to_pandas()
 
     for column in written_arrow_table.column_names:
-        for left, right in zip(lhs[column].to_list(), rhs[column].to_list()):
+        for left, right in zip(lhs[column].to_list(), rhs[column].to_list(), strict=True):
             if column == "map":
                 # Arrow returns a list of tuples, instead of a dict
                 right = dict(right)
@@ -802,7 +883,7 @@ def test_add_files_subset_of_schema(spark: SparkSession, session_catalog: Catalo
     rhs = written_arrow_table.to_pandas()
 
     for column in written_arrow_table.column_names:
-        for left, right in zip(lhs[column].to_list(), rhs[column].to_list()):
+        for left, right in zip(lhs[column].to_list(), rhs[column].to_list(), strict=True):
             assert left == right
 
 
@@ -926,3 +1007,36 @@ def test_add_files_hour_transform(session_catalog: Catalog) -> None:
             writer.write_table(arrow_table)
 
     tbl.add_files(file_paths=[file_path])
+
+
+@pytest.mark.integration
+def test_add_files_to_branch(spark: SparkSession, session_catalog: Catalog, format_version: int) -> None:
+    identifier = f"default.test_add_files_branch_v{format_version}"
+    branch = "branch1"
+
+    tbl = _create_table(session_catalog, identifier, format_version)
+
+    file_paths = [f"s3://warehouse/default/addfile/v{format_version}/test-{i}.parquet" for i in range(5)]
+    # write parquet files
+    for file_path in file_paths:
+        fo = tbl.io.new_output(file_path)
+        with fo.create(overwrite=True) as fos:
+            with pq.ParquetWriter(fos, schema=ARROW_SCHEMA) as writer:
+                writer.write_table(ARROW_TABLE)
+
+    # Dummy write to avoid failures on creating branch in empty table
+    tbl.append(ARROW_TABLE)
+    assert tbl.metadata.current_snapshot_id is not None
+    tbl.manage_snapshots().create_branch(snapshot_id=tbl.metadata.current_snapshot_id, branch_name=branch).commit()
+
+    # add the parquet files as data files
+    tbl.add_files(file_paths=file_paths, branch=branch)
+
+    df = spark.table(identifier)
+    assert df.count() == 1, "Expected 1 row in Main table"
+
+    branch_df = spark.table(f"{identifier}.branch_{branch}")
+    assert branch_df.count() == 6, "Expected 5 rows in branch"
+
+    for col in branch_df.columns:
+        assert branch_df.filter(branch_df[col].isNotNull()).count() == 6, "Expected all 6 rows to be non-null"

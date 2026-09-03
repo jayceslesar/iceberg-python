@@ -15,10 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint:disable=redefined-outer-name,eval-used
+import re
+import uuid
+from pathlib import Path
 from typing import cast
+from urllib.parse import urlparse
 
+import pyarrow as pa
 import pytest
 
+from pyiceberg.catalog import Catalog
+from pyiceberg.exceptions import ValidationException
+from pyiceberg.io.pyarrow import _dataframe_to_data_files
 from pyiceberg.manifest import DataFile, DataFileContent, ManifestContent, ManifestFile
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
@@ -29,7 +37,11 @@ from pyiceberg.table.snapshots import (
     SnapshotSummaryCollector,
     Summary,
     ancestors_between,
+    ancestors_between_ids,
     ancestors_of,
+    is_ancestor_of,
+    is_parent_ancestor_of,
+    latest_ancestor_before_timestamp,
     update_snapshot_summaries,
 )
 from pyiceberg.transforms import IdentityTransform
@@ -78,9 +90,9 @@ def test_serialize_summary_with_properties() -> None:
 
 
 def test_serialize_snapshot(snapshot: Snapshot) -> None:
-    assert (
-        snapshot.model_dump_json()
-        == """{"snapshot-id":25,"parent-snapshot-id":19,"sequence-number":200,"timestamp-ms":1602638573590,"manifest-list":"s3:/a/b/c.avro","summary":{"operation":"append"},"schema-id":3}"""
+    assert snapshot.model_dump_json() == (
+        '{"snapshot-id":25,"parent-snapshot-id":19,"sequence-number":200,"timestamp-ms":1602638573590,'
+        '"manifest-list":"s3:/a/b/c.avro","summary":{"operation":"append"},"schema-id":3}'
     )
 
 
@@ -95,14 +107,17 @@ def test_serialize_snapshot_without_sequence_number() -> None:
         schema_id=3,
     )
     actual = snapshot.model_dump_json()
-    expected = """{"snapshot-id":25,"parent-snapshot-id":19,"timestamp-ms":1602638573590,"manifest-list":"s3:/a/b/c.avro","summary":{"operation":"append"},"schema-id":3}"""
+    expected = (
+        '{"snapshot-id":25,"parent-snapshot-id":19,"timestamp-ms":1602638573590,'
+        '"manifest-list":"s3:/a/b/c.avro","summary":{"operation":"append"},"schema-id":3}'
+    )
     assert actual == expected
 
 
 def test_serialize_snapshot_with_properties(snapshot_with_properties: Snapshot) -> None:
-    assert (
-        snapshot_with_properties.model_dump_json()
-        == """{"snapshot-id":25,"parent-snapshot-id":19,"sequence-number":200,"timestamp-ms":1602638573590,"manifest-list":"s3:/a/b/c.avro","summary":{"operation":"append","foo":"bar"},"schema-id":3}"""
+    assert snapshot_with_properties.model_dump_json() == (
+        '{"snapshot-id":25,"parent-snapshot-id":19,"sequence-number":200,"timestamp-ms":1602638573590,'
+        '"manifest-list":"s3:/a/b/c.avro","summary":{"operation":"append","foo":"bar"},"schema-id":3}'
     )
 
 
@@ -118,36 +133,45 @@ def test_deserialize_summary_with_properties() -> None:
 
 
 def test_deserialize_snapshot(snapshot: Snapshot) -> None:
-    payload = """{"snapshot-id": 25, "parent-snapshot-id": 19, "sequence-number": 200, "timestamp-ms": 1602638573590, "manifest-list": "s3:/a/b/c.avro", "summary": {"operation": "append"}, "schema-id": 3}"""
+    payload = (
+        '{"snapshot-id": 25, "parent-snapshot-id": 19, "sequence-number": 200, "timestamp-ms": 1602638573590, '
+        '"manifest-list": "s3:/a/b/c.avro", "summary": {"operation": "append"}, "schema-id": 3}'
+    )
     actual = Snapshot.model_validate_json(payload)
     assert actual == snapshot
 
 
 def test_deserialize_snapshot_without_operation(snapshot: Snapshot) -> None:
-    payload = """{"snapshot-id": 25, "parent-snapshot-id": 19, "sequence-number": 200, "timestamp-ms": 1602638573590, "manifest-list": "s3:/a/b/c.avro", "summary": {}, "schema-id": 3}"""
+    payload = (
+        '{"snapshot-id": 25, "parent-snapshot-id": 19, "sequence-number": 200, "timestamp-ms": 1602638573590, '
+        '"manifest-list": "s3:/a/b/c.avro", "summary": {}, "schema-id": 3}'
+    )
     with pytest.warns(UserWarning, match="Encountered invalid snapshot summary: operation is missing, defaulting to overwrite"):
         actual = Snapshot.model_validate_json(payload)
     assert actual.summary.operation == Operation.OVERWRITE
 
 
 def test_deserialize_snapshot_with_properties(snapshot_with_properties: Snapshot) -> None:
-    payload = """{"snapshot-id":25,"parent-snapshot-id":19,"sequence-number":200,"timestamp-ms":1602638573590,"manifest-list":"s3:/a/b/c.avro","summary":{"operation":"append","foo":"bar"},"schema-id":3}"""
+    payload = (
+        '{"snapshot-id":25,"parent-snapshot-id":19,"sequence-number":200,"timestamp-ms":1602638573590,'
+        '"manifest-list":"s3:/a/b/c.avro","summary":{"operation":"append","foo":"bar"},"schema-id":3}'
+    )
     snapshot = Snapshot.model_validate_json(payload)
     assert snapshot == snapshot_with_properties
 
 
 def test_snapshot_repr(snapshot: Snapshot) -> None:
-    assert (
-        repr(snapshot)
-        == """Snapshot(snapshot_id=25, parent_snapshot_id=19, sequence_number=200, timestamp_ms=1602638573590, manifest_list='s3:/a/b/c.avro', summary=Summary(Operation.APPEND), schema_id=3)"""
+    assert repr(snapshot) == (
+        "Snapshot(snapshot_id=25, parent_snapshot_id=19, sequence_number=200, timestamp_ms=1602638573590, "
+        "manifest_list='s3:/a/b/c.avro', summary=Summary(Operation.APPEND), schema_id=3)"
     )
     assert snapshot == eval(repr(snapshot))
 
 
 def test_snapshot_with_properties_repr(snapshot_with_properties: Snapshot) -> None:
-    assert (
-        repr(snapshot_with_properties)
-        == """Snapshot(snapshot_id=25, parent_snapshot_id=19, sequence_number=200, timestamp_ms=1602638573590, manifest_list='s3:/a/b/c.avro', summary=Summary(Operation.APPEND, **{'foo': 'bar'}), schema_id=3)"""
+    assert repr(snapshot_with_properties) == (
+        "Snapshot(snapshot_id=25, parent_snapshot_id=19, sequence_number=200, timestamp_ms=1602638573590, "
+        "manifest_list='s3:/a/b/c.avro', summary=Summary(Operation.APPEND, **{'foo': 'bar'}), schema_id=3)"
     )
     assert snapshot_with_properties == eval(repr(snapshot_with_properties))
 
@@ -225,7 +249,10 @@ def test_snapshot_summary_collector_with_partition() -> None:
         "deleted-records": "300",
         "changed-partition-count": "2",
         "partition-summaries-included": "true",
-        "partitions.int_field=1": "added-files-size=1234,removed-files-size=1234,added-data-files=1,deleted-data-files=1,added-records=100,deleted-records=100",
+        "partitions.int_field=1": (
+            "added-files-size=1234,removed-files-size=1234,added-data-files=1,"
+            "deleted-data-files=1,added-records=100,deleted-records=100"
+        ),
         "partitions.int_field=2": "removed-files-size=4321,deleted-data-files=1,deleted-records=200",
     }
 
@@ -261,7 +288,10 @@ def test_snapshot_summary_collector_with_partition_limit_in_constructor() -> Non
         "deleted-records": "300",
         "changed-partition-count": "2",
         "partition-summaries-included": "true",
-        "partitions.int_field=1": "added-files-size=1234,removed-files-size=1234,added-data-files=1,deleted-data-files=1,added-records=100,deleted-records=100",
+        "partitions.int_field=1": (
+            "added-files-size=1234,removed-files-size=1234,added-data-files=1,"
+            "deleted-data-files=1,added-records=100,deleted-records=100"
+        ),
         "partitions.int_field=2": "removed-files-size=4321,deleted-data-files=1,deleted-records=200",
     }
 
@@ -456,3 +486,254 @@ def test_ancestors_between(table_v2_with_extensive_snapshots: Table) -> None:
         )
         == 2000
     )
+
+
+def test_is_ancestor_of(table_v2: Table) -> None:
+    snapshot_id, ancestor_snapshot_id = 3055729675574597004, 3051729675574597004
+
+    # The older snapshot is an ancestor of the newer one.
+    assert is_ancestor_of(snapshot_id, ancestor_snapshot_id, table_v2.metadata)
+    # A snapshot is its own ancestor.
+    assert is_ancestor_of(snapshot_id, snapshot_id, table_v2.metadata)
+    # A descendant is not an ancestor of its parent.
+    assert not is_ancestor_of(ancestor_snapshot_id, snapshot_id, table_v2.metadata)
+    # An ID not in the chain is not an ancestor.
+    assert not is_ancestor_of(snapshot_id, 42, table_v2.metadata)
+    # Raises when the start snapshot ID is missing from metadata.
+    with pytest.raises(ValueError, match="Cannot find snapshot: 42"):
+        is_ancestor_of(42, snapshot_id, table_v2.metadata)
+
+
+def test_is_parent_ancestor_of(table_v2: Table) -> None:
+    snapshot_id, ancestor_snapshot_id = 3055729675574597004, 3051729675574597004
+
+    # The older snapshot is the parent of an ancestor (here, of `snapshot_id` itself).
+    assert is_parent_ancestor_of(snapshot_id, ancestor_snapshot_id, table_v2.metadata)
+    # A snapshot is not its own parent ancestor.
+    assert not is_parent_ancestor_of(snapshot_id, snapshot_id, table_v2.metadata)
+    # A descendant is not a parent ancestor of its parent.
+    assert not is_parent_ancestor_of(ancestor_snapshot_id, snapshot_id, table_v2.metadata)
+    # An ID not referenced anywhere in the chain is not a parent ancestor.
+    assert not is_parent_ancestor_of(snapshot_id, 42, table_v2.metadata)
+    # Raises when the start snapshot ID is missing from metadata.
+    with pytest.raises(ValueError, match="Cannot find snapshot: 42"):
+        is_parent_ancestor_of(42, snapshot_id, table_v2.metadata)
+
+
+def test_ancestors_between_ids(table_v2: Table) -> None:
+    snapshot_id, ancestor_snapshot_id = 3055729675574597004, 3051729675574597004
+
+    # Exclusive-inclusive: just `snapshot_id`.
+    assert [s.snapshot_id for s in ancestors_between_ids(ancestor_snapshot_id, snapshot_id, table_v2.metadata)] == [snapshot_id]
+    # Equal from/to is empty.
+    assert list(ancestors_between_ids(snapshot_id, snapshot_id, table_v2.metadata)) == []
+
+
+def test_ancestors_between_ids_missing_from_snapshot(table_v2: Table) -> None:
+    snapshot_id, ancestor_snapshot_id = 3055729675574597004, 3051729675574597004
+
+    # With from=None, all ancestors are returned.
+    assert [
+        s.snapshot_id
+        for s in ancestors_between_ids(
+            from_snapshot_id_exclusive=None, to_snapshot_id_inclusive=snapshot_id, table_metadata=table_v2.metadata
+        )
+    ] == [snapshot_id, ancestor_snapshot_id]
+
+
+def test_latest_ancestor_before_timestamp() -> None:
+    from pyiceberg.table.metadata import TableMetadataV2
+
+    # Create metadata with 4 snapshots at ordered timestamps
+    metadata = TableMetadataV2(
+        **{
+            "format-version": 2,
+            "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+            "location": "s3://bucket/test/location",
+            "last-sequence-number": 4,
+            "last-updated-ms": 1602638573590,
+            "last-column-id": 1,
+            "current-schema-id": 0,
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "x", "required": True, "type": "long"}]}],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 999,
+            "default-sort-order-id": 0,
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "current-snapshot-id": 4,
+            "snapshots": [
+                {
+                    "snapshot-id": 1,
+                    "timestamp-ms": 1000,
+                    "sequence-number": 1,
+                    "summary": {"operation": "append"},
+                    "manifest-list": "s3://a/1.avro",
+                },
+                {
+                    "snapshot-id": 2,
+                    "parent-snapshot-id": 1,
+                    "timestamp-ms": 2000,
+                    "sequence-number": 2,
+                    "summary": {"operation": "append"},
+                    "manifest-list": "s3://a/2.avro",
+                },
+                {
+                    "snapshot-id": 3,
+                    "parent-snapshot-id": 2,
+                    "timestamp-ms": 3000,
+                    "sequence-number": 3,
+                    "summary": {"operation": "append"},
+                    "manifest-list": "s3://a/3.avro",
+                },
+                {
+                    "snapshot-id": 4,
+                    "parent-snapshot-id": 3,
+                    "timestamp-ms": 4000,
+                    "sequence-number": 4,
+                    "summary": {"operation": "append"},
+                    "manifest-list": "s3://a/4.avro",
+                },
+            ],
+        }
+    )
+
+    result = latest_ancestor_before_timestamp(metadata, 3500)
+    assert result is not None
+    assert result.snapshot_id == 3
+
+    result = latest_ancestor_before_timestamp(metadata, 2500)
+    assert result is not None
+    assert result.snapshot_id == 2
+
+    result = latest_ancestor_before_timestamp(metadata, 5000)
+    assert result is not None
+    assert result.snapshot_id == 4
+
+    result = latest_ancestor_before_timestamp(metadata, 3000)
+    assert result is not None
+    assert result.snapshot_id == 2
+
+    result = latest_ancestor_before_timestamp(metadata, 1000)
+    assert result is None
+
+
+def test_snapshot_producer_bounded_metadata_access(table_v2: Table) -> None:
+    """Transaction.table_metadata replays staged updates via update_table_metadata on
+    every access, so the snapshot producer must not read it once per item. Guards the
+    hoisting introduced in #2674 and extended here.
+    """
+    from unittest import mock
+
+    from pyiceberg.table.update import update_table_metadata
+    from pyiceberg.table.update.snapshot import _FastAppendFiles, _MergeAppendFiles
+
+    def make_file() -> DataFile:
+        return DataFile.from_args(content=DataFileContent.DATA, record_count=1, file_size_in_bytes=1, partition=Record())
+
+    txn = table_v2.transaction()
+
+    with mock.patch("pyiceberg.table.update_table_metadata", wraps=update_table_metadata) as spy:
+        # _summary() cost must not scale with the number of data files
+        def summary_calls(n_files: int) -> int:
+            append = _FastAppendFiles(operation=Operation.APPEND, transaction=txn, io=table_v2.io)
+            for _ in range(n_files):
+                append.append_data_file(make_file())
+            spy.reset_mock()
+            append._summary()
+            return spy.call_count
+
+        few, many = summary_calls(10), summary_calls(100)
+        assert few == many, f"_summary() update_table_metadata calls scale with file count ({few} vs {many})"
+        assert many <= 2, f"_summary() triggered {many} update_table_metadata calls; expected O(1)"
+
+        # _MergeAppendFiles.__init__ should add exactly one call over _FastAppendFiles.__init__
+        spy.reset_mock()
+        _FastAppendFiles(operation=Operation.APPEND, transaction=txn, io=table_v2.io)
+        fast_init = spy.call_count
+        spy.reset_mock()
+        _MergeAppendFiles(operation=Operation.APPEND, transaction=txn, io=table_v2.io)
+        merge_init = spy.call_count
+        assert merge_init - fast_init == 1, (
+            f"_MergeAppendFiles.__init__ made {merge_init - fast_init} extra update_table_metadata "
+            "calls over its superclass; expected 1 (hoisted)"
+        )
+
+
+@pytest.fixture
+def overwrite_table(catalog: Catalog, arrow_table_simple: pa.Table) -> Table:
+    catalog.create_namespace("default")
+    table = catalog.create_table("default.overwrite", arrow_table_simple.schema)
+    table.append(arrow_table_simple)
+    return table
+
+
+def _write_data_file(table: Table, rows: pa.Table) -> DataFile:
+    return next(
+        iter(
+            _dataframe_to_data_files(
+                table_metadata=table.metadata,
+                df=rows,
+                io=table.io,
+                write_uuid=uuid.uuid4(),
+            )
+        )
+    )
+
+
+def _total_data_file_count(table: Table) -> int:
+    snapshot = table.current_snapshot()
+    assert snapshot is not None and snapshot.summary is not None
+    return int(snapshot.summary.additional_properties["total-data-files"])
+
+
+def test_overwrite_replaces_existing_file(overwrite_table: Table, arrow_table_simple: pa.Table) -> None:
+    original_file = next(iter(overwrite_table.scan().plan_files())).file
+    replacement = _write_data_file(overwrite_table, arrow_table_simple.slice(0, 1))
+
+    with overwrite_table.transaction() as tx:
+        with tx.update_snapshot().overwrite() as overwrite:
+            overwrite.delete_data_file(original_file)
+            overwrite.append_data_file(replacement)
+
+    assert overwrite_table.scan().to_arrow()["foo"].to_pylist() == ["a"]
+    assert _total_data_file_count(overwrite_table) == 1
+
+
+def test_overwrite_rejects_explicit_delete_missing_from_base_snapshot(catalog: Catalog, overwrite_table: Table) -> None:
+    stale_file = next(iter(overwrite_table.scan().plan_files())).file
+    stale_rows = overwrite_table.scan().to_arrow()
+
+    # Delete the file before the replacement transaction begins
+    with catalog.load_table(overwrite_table.name()).transaction() as tx:
+        with tx.update_snapshot().overwrite() as overwrite:
+            overwrite.delete_data_file(stale_file)
+
+    current = catalog.load_table(overwrite_table.name())
+    replacement = _write_data_file(current, stale_rows)
+    expected_error = re.escape(f"Missing required files to delete: {stale_file.file_path}")
+
+    with pytest.raises(ValidationException, match=expected_error):
+        with current.transaction() as tx:
+            with tx.update_snapshot().overwrite() as overwrite:
+                overwrite.delete_data_file(stale_file)
+                overwrite.append_data_file(replacement)
+
+    metadata_path = Path(urlparse(current.location()).path) / "metadata"
+    assert not any(metadata_path.glob(f"{overwrite.commit_uuid}-m*.avro"))
+
+    committed = catalog.load_table(overwrite_table.name())
+    assert committed.scan().to_arrow()["foo"].to_pylist() == []
+    assert _total_data_file_count(committed) == 0
+
+
+def test_overwrite_rejects_explicit_delete_without_parent_snapshot(
+    catalog: Catalog, overwrite_table: Table, arrow_table_simple: pa.Table
+) -> None:
+    stale_file = next(iter(overwrite_table.scan().plan_files())).file
+    empty = catalog.create_table("default.empty", arrow_table_simple.schema)
+    expected_error = re.escape(f"Missing required files to delete: {stale_file.file_path}")
+
+    with pytest.raises(ValidationException, match=expected_error):
+        with empty.transaction() as tx:
+            with tx.update_snapshot().overwrite() as overwrite:
+                overwrite.delete_data_file(stale_file)

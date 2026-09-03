@@ -66,7 +66,8 @@ Notes:
         - Stored directly
         - 'Z' -> 90
     Decimal:
-        - Stored as unscaled values in the form of two's-complement big-endian binary using the minimum number of bytes for the values
+        - Stored as unscaled values in the form of two's-complement big-endian binary
+          using the minimum number of bytes for the values
         - 345 is 0...1|01011001 in binary
         - 00000001 -> 1, 01011001 -> 89
     Float:
@@ -85,7 +86,7 @@ from datetime import (
     timezone,
 )
 from decimal import Decimal
-from typing import Any, Union
+from typing import Any
 
 import pytest
 
@@ -159,8 +160,11 @@ def test_unscaled_to_decimal(unscaled: int, scale: int, expected_result: Decimal
         (IntegerType(), "1", 1),
         (IntegerType(), "9999", 9999),
         (LongType(), "123456789", 123456789),
+        (LongType(), "9007199254740993", 9007199254740993),
+        (LongType(), str(LongType.max), LongType.max),
         (FloatType(), "1.1", 1.1),
         (DoubleType(), "99999.9", 99999.9),
+        (TimestampNanoType(), "9007199254740993", 9007199254740993),
         (DecimalType(5, 2), "123.45", Decimal("123.45")),
         (StringType(), "foo", "foo"),
         (UUIDType(), "f79c3e09-677c-4bbd-a479-3f349cb785e7", uuid.UUID("f79c3e09-677c-4bbd-a479-3f349cb785e7")),
@@ -549,7 +553,7 @@ def test_raise_on_incorrect_precision_or_scale(primitive_type: DecimalType, valu
         (TimeType(), time(12, 30, 45, 500000), b"`\xc8\xeb|\n\x00\x00\x00"),
     ],
 )
-def test_datetime_obj_to_bytes(primitive_type: PrimitiveType, value: Union[datetime, date, time], expected_bytes: bytes) -> None:
+def test_datetime_obj_to_bytes(primitive_type: PrimitiveType, value: datetime | date | time, expected_bytes: bytes) -> None:
     bytes_from_value = conversions.to_bytes(primitive_type, value)
 
     assert bytes_from_value == expected_bytes

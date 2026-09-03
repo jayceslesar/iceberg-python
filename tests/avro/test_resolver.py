@@ -16,7 +16,6 @@
 # under the License.
 
 from tempfile import TemporaryDirectory
-from typing import Optional
 
 import pytest
 from pydantic import Field
@@ -257,6 +256,15 @@ def test_resolve_decimal_to_decimal_reduce_precision() -> None:
     assert "Cannot reduce precision from decimal(19, 25) to decimal(10, 25)" in str(exc_info.value)
 
 
+def test_resolve_decimal_to_decimal_change_scale() -> None:
+    # Changing the scale is not a valid promotion, even when the precision widens.
+    # Allowing it would reinterpret the file's unscaled integers at the wrong scale.
+    with pytest.raises(ResolveError) as exc_info:
+        _ = resolve_reader(DecimalType(9, 2), DecimalType(18, 4))
+
+    assert "Cannot reduce precision from decimal(9, 2) to decimal(18, 4)" in str(exc_info.value)
+
+
 def test_column_assignment() -> None:
     int_schema = {
         "type": "record",
@@ -287,7 +295,7 @@ def test_column_assignment() -> None:
 
         class Ints(Record):
             c: int = Field()
-            d: Optional[int] = Field()
+            d: int | None = Field()
 
         ints_schema = Schema(
             NestedField(3, "c", IntegerType(), required=True),

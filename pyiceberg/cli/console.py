@@ -15,14 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint: disable=broad-except,redefined-builtin,redefined-outer-name
+import logging
+from collections.abc import Callable
 from functools import wraps
 from typing import (
     Any,
-    Callable,
-    Dict,
     Literal,
-    Optional,
-    Tuple,
 )
 
 import click
@@ -32,6 +30,7 @@ from pyiceberg import __version__
 from pyiceberg.catalog import URI, Catalog, load_catalog
 from pyiceberg.cli.output import ConsoleOutput, JsonOutput, Output
 from pyiceberg.exceptions import NoSuchNamespaceError, NoSuchPropertyException, NoSuchTableError
+from pyiceberg.io import WAREHOUSE
 from pyiceberg.table import TableProperties
 from pyiceberg.table.refs import SnapshotRef, SnapshotRefType
 from pyiceberg.utils.properties import property_as_int
@@ -55,22 +54,38 @@ def catch_exception() -> Callable:  # type: ignore
 
 
 @click.group()
+@click.version_option(__version__, message="%(version)s")
 @click.option("--catalog")
 @click.option("--verbose", type=click.BOOL)
 @click.option("--output", type=click.Choice(["text", "json"]), default="text")
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], case_sensitive=False),
+    default="WARNING",
+    envvar="PYICEBERG_LOG_LEVEL",
+    help="Set the logging level",
+)
 @click.option("--ugi")
 @click.option("--uri")
 @click.option("--credential")
+@click.option("--warehouse")
 @click.pass_context
 def run(
     ctx: Context,
-    catalog: Optional[str],
+    catalog: str | None,
     verbose: bool,
     output: str,
-    ugi: Optional[str],
-    uri: Optional[str],
-    credential: Optional[str],
+    log_level: str,
+    ugi: str | None,
+    uri: str | None,
+    credential: str | None,
+    warehouse: str | None,
 ) -> None:
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format="%(asctime)s:%(levelname)s:%(name)s:%(message)s",
+    )
+
     properties = {}
     if ugi:
         properties["ugi"] = ugi
@@ -78,12 +93,17 @@ def run(
         properties[URI] = uri
     if credential:
         properties["credential"] = credential
+    if warehouse:
+        properties[WAREHOUSE] = warehouse
 
     ctx.ensure_object(dict)
     if output == "text":
         ctx.obj["output"] = ConsoleOutput(verbose=verbose)
     else:
         ctx.obj["output"] = JsonOutput(verbose=verbose)
+
+    if ctx.invoked_subcommand == "version":
+        return
 
     try:
         ctx.obj["catalog"] = load_catalog(catalog, **properties)
@@ -98,7 +118,7 @@ def run(
         ctx.exit(1)
 
 
-def _catalog_and_output(ctx: Context) -> Tuple[Catalog, Output]:
+def _catalog_and_output(ctx: Context) -> tuple[Catalog, Output]:
     """Small helper to set the types."""
     return ctx.obj["catalog"], ctx.obj["output"]
 
@@ -107,7 +127,7 @@ def _catalog_and_output(ctx: Context) -> Tuple[Catalog, Output]:
 @click.pass_context
 @click.argument("parent", required=False)
 @catch_exception()
-def list(ctx: Context, parent: Optional[str]) -> None:  # pylint: disable=redefined-builtin
+def list(ctx: Context, parent: str | None) -> None:  # pylint: disable=redefined-builtin
     """List tables or namespaces."""
     catalog, output = _catalog_and_output(ctx)
 
@@ -216,7 +236,12 @@ def location(ctx: Context, identifier: str) -> None:
 @click.pass_context
 @catch_exception()
 def version(ctx: Context) -> None:
-    """Print pyiceberg version."""
+    """Print the installed pyiceberg package version. Deprecated: use --version instead."""
+    click.echo(
+        "Deprecation warning: the `version` command is deprecated and will be removed in 0.13.0. "
+        "Please use `pyiceberg --version` instead.",
+        err=True,
+    )
     ctx.obj["output"].version(__version__)
 
 
@@ -244,14 +269,19 @@ def drop() -> None:
 
 @drop.command()
 @click.argument("identifier")
+@click.option("--purge", is_flag=True, help="Request that the catalog purge all table files.", default=False)
 @click.pass_context
 @catch_exception()
-def table(ctx: Context, identifier: str) -> None:  # noqa: F811
+def table(ctx: Context, identifier: str, purge: bool) -> None:  # noqa: F811
     """Drop a table."""
     catalog, output = _catalog_and_output(ctx)
 
-    catalog.drop_table(identifier)
-    output.text(f"Dropped table: {identifier}")
+    if purge:
+        catalog.purge_table(identifier)
+    else:
+        catalog.drop_table(identifier)
+    purge_message = " (purge requested)" if purge else ""
+    output.text(f"Dropped table: {identifier}{purge_message}")
 
 
 @drop.command()  # type: ignore
@@ -301,13 +331,15 @@ def get_namespace(ctx: Context, identifier: str, property_name: str) -> None:
 
     namespace_properties = catalog.load_namespace_properties(identifier_tuple)
 
-    if property_name:
-        if property_value := namespace_properties.get(property_name):
-            output.text(property_value)
-        else:
-            raise NoSuchPropertyException(f"Could not find property {property_name} on namespace {identifier}")
-    else:
+    if not property_name:
         output.describe_properties(namespace_properties)
+        return
+
+    property_value = namespace_properties.get(property_name)
+    if property_value is None:
+        raise NoSuchPropertyException(f"Could not find property {property_name} on namespace {identifier}")
+
+    output.text(property_value)
 
 
 @get.command("table")
@@ -322,13 +354,15 @@ def get_table(ctx: Context, identifier: str, property_name: str) -> None:
 
     metadata = catalog.load_table(identifier_tuple).metadata
 
-    if property_name:
-        if property_value := metadata.properties.get(property_name):
-            output.text(property_value)
-        else:
-            raise NoSuchPropertyException(f"Could not find property {property_name} on table {identifier}")
-    else:
+    if not property_name:
         output.describe_properties(metadata.properties)
+        return
+
+    property_value = metadata.properties.get(property_name)
+    if property_value is None:
+        raise NoSuchPropertyException(f"Could not find property {property_name} on table {identifier}")
+
+    output.text(property_value)
 
 
 @properties.group()
@@ -431,7 +465,7 @@ def list_refs(ctx: Context, identifier: str, type: str, verbose: bool) -> None:
     output.describe_refs(relevant_refs)
 
 
-def _retention_properties(ref: SnapshotRef, table_properties: Dict[str, str]) -> Dict[str, str]:
+def _retention_properties(ref: SnapshotRef, table_properties: dict[str, str]) -> dict[str, str]:
     retention_properties = {}
     if ref.snapshot_ref_type == SnapshotRefType.BRANCH:
         default_min_snapshots_to_keep = property_as_int(

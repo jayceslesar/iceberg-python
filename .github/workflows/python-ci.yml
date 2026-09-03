@@ -24,42 +24,42 @@ on:
     branches:
     - 'main'
   pull_request:
-    paths:
-    - '**'                              # Include all files and directories in the repository by default.
-    - '!.github/workflows/**'           # Exclude all workflow files
-    - '.github/workflows/python-ci.yml' # except the current file.
-    - '!.github/ISSUE_TEMPLATE/**'      # Exclude files and directories that don't impact tests or code like templates, metadata, and documentation.
-    - '!.gitignore'
-    - '!.asf.yml'
-    - '!mkdocs/**'
-    - '!.gitattributes'
-    - '!README.md'
-    - '!CONTRIBUTING.md'
-    - '!LICENSE'
-    - '!NOTICE'
+  merge_group:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  lint-and-test:
+  lint-and-unit-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
+      max-parallel: 15
+      fail-fast: true
       matrix:
-        python: ['3.9', '3.10', '3.11', '3.12']
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
 
     steps:
-    - uses: actions/checkout@v5
-    - uses: actions/setup-python@v6
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
       with:
         python-version: ${{ matrix.python }}
-    - name: Install poetry
-      run: make install-poetry
+    - name: Install UV
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      with:
+        enable-cache: true
     - name: Install system dependencies
       run: sudo apt-get update && sudo apt-get install -y libkrb5-dev # for kerberos
+    - name: Check uv.lock is up to date
+      run: uv lock --check
     - name: Install
-      run: make install-dependencies
+      run: make install
     - name: Run linters
       run: make lint
     - name: Run unit tests with coverage
@@ -67,42 +67,65 @@ jobs:
     - name: Generate coverage report (85%) # Coverage threshold should only increase over time — never decrease it!
       run: COVERAGE_FAIL_UNDER=85 make coverage-report
 
-  integration-test:
-    runs-on: ubuntu-latest
+  windows-unit-test:
+    runs-on: windows-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: true
       matrix:
-        python: ['3.9', '3.10', '3.11', '3.12']
+        python: ['3.12']
 
     steps:
-    - uses: actions/checkout@v5
-    - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y libkrb5-dev # for kerberos
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ matrix.python }}
+    - name: Install UV
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      with:
+        enable-cache: true
     - name: Install
-      run: make install
+      run: uv sync --all-extras --no-extra hive-kerberos
+    - name: Run unit tests
+      run: uv run python -m pytest tests/ -m "(unmarked or parametrize) and not integration" --ignore=tests/integration -v -x
 
-    - name: Run integration tests with coverage
-      run: COVERAGE=1 make test-integration
-    - name: Show debug logs
-      if: ${{ failure() }}
-      run: docker compose -f dev/docker-compose.yml logs
+  cibw-dev-env-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: '3.12'
+    - name: Install UV
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      with:
+        enable-cache: true
+    # Why this exists:
+    # Catch import-time regressions (e.g., global conftest optional deps)
+    # in the same dev-only environment used by cibuildwheel wheel tests.
+    # Keep this in sync with wheel build test setup in
+    # .github/workflows/pypi-build-artifacts.yml:
+    #   CIBW_BEFORE_TEST: uv sync --directory {project} --only-group dev --no-install-project
+    #   CIBW_TEST_COMMAND: uv run --directory {project} pytest tests/avro/test_decoder.py
+    - name: Mirror wheel CIBW_BEFORE_TEST
+      run: uv sync --directory . --only-group dev --no-install-project
+    - name: Mirror wheel CIBW_TEST_COMMAND
+      run: uv run --directory . pytest tests/avro/test_decoder.py
 
-    - name: Run s3 integration tests with coverage
-      run: COVERAGE=1 make test-s3
-    - name: Show debug logs
-      if: ${{ failure() }}
-      run: docker compose -f dev/docker-compose.yml logs
-
-    - name: Run adls integration tests with coverage
-      run: COVERAGE=1 make test-adls
-    - name: Show debug logs
-      if: ${{ failure() }}
-      run: docker compose -f dev/docker-compose-azurite.yml logs
-
-    - name: Run gcs integration tests with coverage
-      run: COVERAGE=1 make test-gcs
-    - name: Show debug logs
-      if: ${{ failure() }}
-      run: docker compose -f dev/docker-compose-gcs-server.yml logs
-
-    - name: Generate coverage report (75%) # Coverage threshold should only increase over time — never decrease it!
-      run: COVERAGE_FAIL_UNDER=75 make coverage-report
+  python-ci-required:
+    if: ${{ always() }}
+    needs: [lint-and-unit-test, windows-unit-test, cibw-dev-env-smoke-test]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Verify Python CI jobs succeeded
+      env:
+        RESULTS: ${{ join(needs.*.result, ' ') }}
+      run: |
+        read -ra results <<< "$RESULTS"
+        for result in "${results[@]}"; do
+          test "$result" = "success"
+        done

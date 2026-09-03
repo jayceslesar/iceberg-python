@@ -27,10 +27,12 @@ from datetime import date, datetime, time
 from decimal import ROUND_HALF_UP, Decimal
 from functools import singledispatchmethod
 from math import isnan
-from typing import Any, Generic, Type
+from typing import Any, Generic
 from uuid import UUID
 
-from pyiceberg.typedef import L
+from pydantic import Field, model_serializer
+
+from pyiceberg.typedef import IcebergRootModel, L
 from pyiceberg.types import (
     BinaryType,
     BooleanType,
@@ -52,7 +54,9 @@ from pyiceberg.utils.datetime import (
     date_str_to_days,
     date_to_days,
     datetime_to_micros,
+    days_to_date,
     micros_to_days,
+    micros_to_timestamp,
     time_str_to_micros,
     time_to_micros,
     timestamp_to_micros,
@@ -64,21 +68,31 @@ from pyiceberg.utils.singleton import Singleton
 UUID_BYTES_LENGTH = 16
 
 
-class Literal(Generic[L], ABC):
+def _parse_numeric_string(value: str) -> Decimal:
+    number = Decimal(value)
+    if not number.is_finite():
+        raise ValueError(f"Cannot convert non-finite numeric string: {value}")
+    return number
+
+
+class Literal(IcebergRootModel[L], Generic[L], ABC):  # type: ignore
     """Literal which has a value and can be converted between types."""
 
-    _value: L
+    root: L = Field()
 
-    def __init__(self, value: L, value_type: Type[L]):
+    def __init__(self, value: L, value_type: type[L], /, **data):  # type: ignore
+        if value is None:
+            raise TypeError("Invalid literal value: None")
+
+        super().__init__(value)
         if value is None or not isinstance(value, value_type):
             raise TypeError(f"Invalid literal value: {value!r} (not a {value_type})")
         if isinstance(value, float) and isnan(value):
             raise ValueError("Cannot create expression literal from NaN.")
-        self._value = value
 
     @property
     def value(self) -> L:
-        return self._value
+        return self.root
 
     @singledispatchmethod
     @abstractmethod
@@ -136,7 +150,7 @@ def literal(value: L) -> Literal[L]:
         LongLiteral(123)
     """
     if isinstance(value, float):
-        return DoubleLiteral(value)  # type: ignore
+        return DoubleLiteral(value)
     elif isinstance(value, bool):
         return BooleanLiteral(value)
     elif isinstance(value, int):
@@ -144,17 +158,17 @@ def literal(value: L) -> Literal[L]:
     elif isinstance(value, str):
         return StringLiteral(value)
     elif isinstance(value, UUID):
-        return UUIDLiteral(value.bytes)  # type: ignore
+        return UUIDLiteral(value.bytes)
     elif isinstance(value, bytes):
         return BinaryLiteral(value)
     elif isinstance(value, Decimal):
         return DecimalLiteral(value)
     elif isinstance(value, datetime):
-        return TimestampLiteral(datetime_to_micros(value))  # type: ignore
+        return TimestampLiteral(datetime_to_micros(value))
     elif isinstance(value, date):
-        return DateLiteral(date_to_days(value))  # type: ignore
+        return DateLiteral(date_to_days(value))
     elif isinstance(value, time):
-        return TimeLiteral(time_to_micros(value))  # type: ignore
+        return TimeLiteral(time_to_micros(value))
     else:
         raise TypeError(f"Invalid literal value: {repr(value)}")
 
@@ -237,7 +251,7 @@ class LongAboveMax(AboveMax[int], Singleton):
 
     @singledispatchmethod
     def to(self, type_var: IcebergType) -> Literal:  # type: ignore
-        raise TypeError("Cannot change the type of IntAboveMax")
+        raise TypeError("Cannot change the type of LongAboveMax")
 
     @to.register(LongType)
     def _(self, _: LongType) -> Literal[int]:
@@ -250,7 +264,7 @@ class LongBelowMin(BelowMin[int], Singleton):
 
     @singledispatchmethod
     def to(self, type_var: IcebergType) -> Literal:  # type: ignore
-        raise TypeError("Cannot change the type of IntBelowMin")
+        raise TypeError("Cannot change the type of LongBelowMin")
 
     @to.register(LongType)
     def _(self, _: LongType) -> Literal[int]:
@@ -303,6 +317,10 @@ class LongLiteral(Literal[int]):
 
     @to.register(FloatType)
     def _(self, _: FloatType) -> Literal[float]:
+        if FloatType.max < self.value:
+            return FloatAboveMax()
+        elif self.value < FloatType.min:
+            return FloatBelowMin()
         return FloatLiteral(float(self.value))
 
     @to.register(DoubleType)
@@ -311,6 +329,10 @@ class LongLiteral(Literal[int]):
 
     @to.register(DateType)
     def _(self, _: DateType) -> Literal[int]:
+        if IntegerType.max < self.value:
+            return IntAboveMax()
+        elif IntegerType.min > self.value:
+            return IntBelowMin()
         return DateLiteral(self.value)
 
     @to.register(TimeType)
@@ -411,6 +433,10 @@ class DateLiteral(Literal[int]):
     def __init__(self, value: int) -> None:
         super().__init__(value, int)
 
+    @model_serializer
+    def ser_model(self) -> date:
+        return days_to_date(self.root)
+
     def increment(self) -> Literal[int]:
         return DateLiteral(self.value + 1)
 
@@ -442,6 +468,10 @@ class TimeLiteral(Literal[int]):
 class TimestampLiteral(Literal[int]):
     def __init__(self, value: int) -> None:
         super().__init__(value, int)
+
+    @model_serializer
+    def ser_model(self) -> str:
+        return micros_to_timestamp(self.root).isoformat()
 
     def increment(self) -> Literal[int]:
         return TimestampLiteral(self.value + 1)
@@ -504,9 +534,9 @@ class DecimalLiteral(Literal[Decimal]):
     def _(self, _: LongType) -> Literal[int]:
         value_int = int(self.value.to_integral_value())
         if value_int > LongType.max:
-            return IntAboveMax()
+            return LongAboveMax()
         elif value_int < LongType.min:
-            return IntBelowMin()
+            return LongBelowMin()
         else:
             return LongLiteral(value_int)
 
@@ -540,27 +570,27 @@ class StringLiteral(Literal[str]):
     @to.register(IntegerType)
     def _(self, type_var: IntegerType) -> Literal[int]:
         try:
-            number = int(float(self.value))
+            number = _parse_numeric_string(self.value)
 
             if IntegerType.max < number:
                 return IntAboveMax()
             elif IntegerType.min > number:
                 return IntBelowMin()
-            return LongLiteral(number)
-        except ValueError as e:
+            return LongLiteral(int(number))
+        except (ArithmeticError, OverflowError, ValueError) as e:
             raise ValueError(f"Could not convert {self.value} into a {type_var}") from e
 
     @to.register(LongType)
     def _(self, type_var: LongType) -> Literal[int]:
         try:
-            long_value = int(float(self.value))
+            long_value = _parse_numeric_string(self.value)
             if LongType.max < long_value:
                 return LongAboveMax()
             elif LongType.min > long_value:
                 return LongBelowMin()
             else:
-                return LongLiteral(long_value)
-        except (TypeError, ValueError) as e:
+                return LongLiteral(int(long_value))
+        except (ArithmeticError, OverflowError, TypeError, ValueError) as e:
             raise ValueError(f"Could not convert {self.value} into a {type_var}") from e
 
     @to.register(DateType)
@@ -635,6 +665,10 @@ class UUIDLiteral(Literal[bytes]):
     def __init__(self, value: bytes) -> None:
         super().__init__(value, bytes)
 
+    @model_serializer
+    def ser_model(self) -> UUID:
+        return UUID(bytes=self.root)
+
     @singledispatchmethod
     def to(self, type_var: IcebergType) -> Literal:  # type: ignore
         raise TypeError(f"Cannot convert UUIDLiteral into {type_var}")
@@ -660,6 +694,10 @@ class UUIDLiteral(Literal[bytes]):
 class FixedLiteral(Literal[bytes]):
     def __init__(self, value: bytes) -> None:
         super().__init__(value, bytes)
+
+    @model_serializer
+    def ser_model(self) -> str:
+        return self.root.hex()
 
     @singledispatchmethod
     def to(self, type_var: IcebergType) -> Literal:  # type: ignore
@@ -691,6 +729,10 @@ class FixedLiteral(Literal[bytes]):
 class BinaryLiteral(Literal[bytes]):
     def __init__(self, value: bytes) -> None:
         super().__init__(value, bytes)
+
+    @model_serializer
+    def ser_model(self) -> str:
+        return self.root.hex()
 
     @singledispatchmethod
     def to(self, type_var: IcebergType) -> Literal:  # type: ignore

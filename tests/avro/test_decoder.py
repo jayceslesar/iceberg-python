@@ -18,9 +18,9 @@ from __future__ import annotations
 
 import itertools
 import struct
+from collections.abc import Callable
 from io import SEEK_SET
 from types import TracebackType
-from typing import Callable, Optional, Type
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -129,9 +129,7 @@ class OneByteAtATimeInputStream(InputStream):
     def __enter__(self) -> OneByteAtATimeInputStream:
         return self
 
-    def __exit__(
-        self, exctype: Optional[Type[BaseException]], excinst: Optional[BaseException], exctb: Optional[TracebackType]
-    ) -> None:
+    def __exit__(self, exctype: type[BaseException] | None, excinst: BaseException | None, exctb: TracebackType | None) -> None:
         self.close()
 
 
@@ -160,6 +158,23 @@ def test_skip_float(decoder_class: Callable[[bytes], BinaryDecoder]) -> None:
 def test_read_double(decoder_class: Callable[[bytes], BinaryDecoder]) -> None:
     decoder = decoder_class(b"\x00\x00\x00\x00\x00\x40\x33\x40")
     assert decoder.read_double() == 19.25
+
+
+@pytest.mark.parametrize("decoder_class", AVAILABLE_DECODERS)
+@pytest.mark.parametrize(
+    "value",
+    [
+        3.141592653589793,
+        429496729622.314,
+        0.1,
+        1.0000000000000002,  # smallest double above 1.0
+        1e308,  # overflows to inf in single precision
+        5e-324,  # underflows to 0.0 in single precision
+    ],
+)
+def test_read_double_keeps_full_precision(decoder_class: Callable[[bytes], BinaryDecoder], value: float) -> None:
+    decoder = decoder_class(struct.pack("<d", value))
+    assert decoder.read_double() == value
 
 
 @pytest.mark.parametrize("decoder_class", AVAILABLE_DECODERS)

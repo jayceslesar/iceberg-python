@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+from datetime import datetime
 from pathlib import PosixPath
 
 import pyarrow as pa
@@ -26,12 +27,14 @@ from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.expressions import AlwaysTrue, And, EqualTo, Reference
 from pyiceberg.expressions.literals import LongLiteral
 from pyiceberg.io.pyarrow import schema_to_pyarrow
+from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
-from pyiceberg.table import UpsertResult
+from pyiceberg.table import Table, UpsertResult
 from pyiceberg.table.snapshots import Operation
 from pyiceberg.table.upsert_util import create_match_filter
-from pyiceberg.types import IntegerType, NestedField, StringType, StructType
-from tests.catalog.test_base import InMemoryCatalog, Table
+from pyiceberg.transforms import DayTransform
+from pyiceberg.types import IntegerType, NestedField, StringType, StructType, TimestampType
+from tests.catalog.test_base import InMemoryCatalog
 
 
 @pytest.fixture
@@ -120,7 +123,10 @@ def assert_upsert_result(res: UpsertResult, expected_updated: int, expected_inse
 
 
 @pytest.mark.parametrize(
-    "join_cols, src_start_row, src_end_row, target_start_row, target_end_row, when_matched_update_all, when_not_matched_insert_all, expected_updated, expected_inserted",
+    (
+        "join_cols, src_start_row, src_end_row, target_start_row, target_end_row, "
+        "when_matched_update_all, when_not_matched_insert_all, expected_updated, expected_inserted"
+    ),
     [
         (["order_id"], 1, 2, 2, 3, True, True, 1, 1),  # single row
         (["order_id"], 5001, 15000, 1, 10000, True, True, 5000, 5000),  # 10k rows
@@ -711,6 +717,42 @@ def test_upsert_with_nulls(catalog: Catalog) -> None:
     )
 
 
+def test_upsert_on_table_partitioned_by_transform(catalog: Catalog) -> None:
+    """Upsert has to rewrite the matched file on a table partitioned by a non-identity transform.
+
+    The manifest pruning in the overwrite builds its predicate from the partition records of
+    the deleted files. Those records hold already-transformed values, so referencing the source
+    column would send them through the transform twice, prune away the only relevant manifest
+    and leave the replaced row behind as a duplicate.
+    """
+    identifier = "default.test_upsert_on_table_partitioned_by_transform"
+    _drop_table(catalog, identifier)
+
+    schema = Schema(
+        NestedField(1, "k", StringType(), required=False),
+        NestedField(2, "v", IntegerType(), required=False),
+        NestedField(3, "ts", TimestampType(), required=False),
+    )
+    spec = PartitionSpec(PartitionField(source_id=3, field_id=1000, transform=DayTransform(), name="ts_day"))
+    table = catalog.create_table(identifier, schema, partition_spec=spec)
+
+    arrow_schema = schema_to_pyarrow(schema)
+    # A timestamp whose day ordinal is far from the value it would be read as if the
+    # DayTransform were applied a second time.
+    ts = datetime(2026, 1, 6, 12)
+
+    def rows(pairs: list[tuple[str, int]]) -> pa_table:
+        return pa.Table.from_pylist([{"k": k, "v": v, "ts": ts} for k, v in pairs], schema=arrow_schema)
+
+    table.append(rows([("a", 1), ("b", 1)]))
+
+    res = table.upsert(rows([("a", 2)]), join_cols=["k"])
+    assert_upsert_result(res, expected_updated=1, expected_inserted=0)
+
+    arrow = table.scan().to_arrow()
+    assert sorted(zip(arrow["k"].to_pylist(), arrow["v"].to_pylist(), strict=True)) == [("a", 2), ("b", 1)]
+
+
 def test_transaction(catalog: Catalog) -> None:
     """Test the upsert within a Transaction. Make sure that if something fails the entire Transaction is
     rolled back."""
@@ -834,3 +876,54 @@ def test_stage_only_upsert(catalog: Catalog) -> None:
     assert operations == ["append", "append", "append"]
     # both subsequent parent id should be the first snapshot id
     assert parent_snapshot_id == [None, current_snapshot, current_snapshot]
+
+
+def test_upsert_snapshot_properties(catalog: Catalog) -> None:
+    """Test that snapshot_properties are applied to snapshots created by upsert."""
+    identifier = "default.test_upsert_snapshot_properties"
+    _drop_table(catalog, identifier)
+
+    schema = Schema(
+        NestedField(1, "city", StringType(), required=True),
+        NestedField(2, "population", IntegerType(), required=True),
+        identifier_field_ids=[1],
+    )
+
+    tbl = catalog.create_table(identifier, schema=schema)
+    arrow_schema = pa.schema(
+        [
+            pa.field("city", pa.string(), nullable=False),
+            pa.field("population", pa.int32(), nullable=False),
+        ]
+    )
+
+    # Initial data
+    df = pa.Table.from_pylist(
+        [{"city": "Amsterdam", "population": 921402}],
+        schema=arrow_schema,
+    )
+    tbl.append(df)
+    initial_snapshot_count = len(list(tbl.snapshots()))
+
+    # Upsert with snapshot_properties (both update and insert)
+    df = pa.Table.from_pylist(
+        [
+            {"city": "Amsterdam", "population": 950000},  # Update
+            {"city": "Berlin", "population": 3432000},  # Insert
+        ],
+        schema=arrow_schema,
+    )
+    result = tbl.upsert(df, snapshot_properties={"test_prop": "test_value"})
+
+    assert result.rows_updated == 1
+    assert result.rows_inserted == 1
+
+    # Verify properties are on the snapshots created by upsert
+    snapshots = list(tbl.snapshots())
+    # Upsert should have created additional snapshots (overwrite + append)
+    assert len(snapshots) > initial_snapshot_count
+
+    # Check that all new snapshots have the snapshot_properties
+    for snapshot in snapshots[initial_snapshot_count:]:
+        assert snapshot.summary is not None
+        assert snapshot.summary.additional_properties.get("test_prop") == "test_value"

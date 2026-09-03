@@ -25,6 +25,7 @@ import pytest
 from click.testing import CliRunner
 from pytest_mock import MockFixture
 
+from pyiceberg import __version__
 from pyiceberg.catalog.memory import InMemoryCatalog
 from pyiceberg.cli.console import run
 from pyiceberg.io import WAREHOUSE
@@ -46,6 +47,48 @@ def test_missing_uri(mocker: MockFixture, empty_home_dir_path: str) -> None:
 
     assert result.exit_code == 1
     assert result.output == "Could not initialize catalog with the following properties: {}\n"
+
+
+def test_hive_catalog_missing_uri_shows_helpful_error(mocker: MockFixture) -> None:
+    mock_env_config = mocker.MagicMock()
+    mock_env_config.get_catalog_config.return_value = {"type": "hive"}
+    mocker.patch("pyiceberg.catalog._ENV_CONFIG", mock_env_config)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["--catalog", "my_hive_catalog", "list"])
+
+    assert result.exit_code == 1
+    assert "URI missing, please provide using --uri" in result.output
+    assert "'uri'" not in result.output
+
+
+def test_version_does_not_load_catalog(mocker: MockFixture) -> None:
+    mock_load_catalog = mocker.patch("pyiceberg.cli.console.load_catalog", side_effect=Exception("should not be called"))
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["version"])
+
+    assert result.exit_code == 0
+    assert result.stdout == f"{__version__}\n"
+    mock_load_catalog.assert_not_called()
+
+
+def test_version_flag() -> None:
+    runner = CliRunner()
+    result = runner.invoke(run, ["--version"])
+
+    assert result.exit_code == 0
+    assert result.output == f"{__version__}\n"
+
+
+def test_version_command_emits_deprecation_warning() -> None:
+    runner = CliRunner()
+    result = runner.invoke(run, ["version"])
+
+    assert result.exit_code == 0
+    assert result.stdout == f"{__version__}\n"
+    assert "deprecated" in result.stderr.lower()
+    assert "pyiceberg --version" in result.stderr
 
 
 @pytest.fixture(autouse=True)
@@ -297,6 +340,22 @@ def test_drop_table(catalog: InMemoryCatalog) -> None:
     assert result.output == """Dropped table: default.my_table\n"""
 
 
+def test_drop_table_with_purge(catalog: InMemoryCatalog, mocker: MockFixture) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+    )
+    purge_table = mocker.spy(catalog, "purge_table")
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["drop", "table", "default.my_table", "--purge"])
+    assert result.exit_code == 0
+    assert result.output == """Dropped table: default.my_table (purge requested)\n"""
+    purge_table.assert_called_once_with("default.my_table")
+
+
 def test_drop_table_does_not_exists(catalog: InMemoryCatalog) -> None:
     # pylint: disable=unused-argument
 
@@ -397,6 +456,21 @@ def test_properties_get_table_specific_property(catalog: InMemoryCatalog) -> Non
     assert result.output == "134217728\n"
 
 
+def test_properties_get_table_specific_empty_property(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE)
+    catalog.create_table(
+        identifier=TEST_TABLE_IDENTIFIER,
+        schema=TEST_TABLE_SCHEMA,
+        partition_spec=TEST_TABLE_PARTITION_SPEC,
+        properties={"empty": ""},
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "table", "default.my_table", "empty"])
+    assert result.exit_code == 0
+    assert result.output == "\n"
+
+
 def test_properties_get_table_specific_property_that_doesnt_exist(catalog: InMemoryCatalog) -> None:
     catalog.create_namespace(TEST_TABLE_NAMESPACE)
     catalog.create_table(
@@ -437,6 +511,26 @@ def test_properties_get_namespace_specific_property(catalog: InMemoryCatalog, na
     result = runner.invoke(run, ["properties", "get", "namespace", "default", "location"])
     assert result.exit_code == 0
     assert result.output == "s3://warehouse/database/location\n"
+
+
+def test_properties_get_namespace_specific_empty_property(catalog: InMemoryCatalog) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, {"empty": ""})
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "namespace", "default", "empty"])
+    assert result.exit_code == 0
+    assert result.output == "\n"
+
+
+def test_properties_get_namespace_specific_property_that_doesnt_exist(
+    catalog: InMemoryCatalog, namespace_properties: Properties
+) -> None:
+    catalog.create_namespace(TEST_TABLE_NAMESPACE, namespace_properties)
+
+    runner = CliRunner()
+    result = runner.invoke(run, ["properties", "get", "namespace", "default", "doesnotexist"])
+    assert result.exit_code == 1
+    assert result.output == "Could not find property doesnotexist on namespace default\n"
 
 
 def test_properties_get_namespace_does_not_exist(catalog: InMemoryCatalog, namespace_properties: Properties) -> None:
@@ -627,9 +721,10 @@ def test_json_schema(catalog: InMemoryCatalog) -> None:
     runner = CliRunner()
     result = runner.invoke(run, ["--output=json", "schema", "default.my_table"])
     assert result.exit_code == 0
-    assert (
-        result.output
-        == """{"type":"struct","fields":[{"id":1,"name":"x","type":"long","required":true},{"id":2,"name":"y","type":"long","required":true,"doc":"comment"},{"id":3,"name":"z","type":"long","required":true}],"schema-id":0,"identifier-field-ids":[]}\n"""
+    assert result.output == (
+        '{"type":"struct","fields":[{"id":1,"name":"x","type":"long","required":true},'
+        '{"id":2,"name":"y","type":"long","required":true,"doc":"comment"},'
+        '{"id":3,"name":"z","type":"long","required":true}],"schema-id":0,"identifier-field-ids":[]}\n'
     )
 
 
@@ -819,9 +914,8 @@ def test_json_properties_get_table_specific_property_that_doesnt_exist(catalog: 
     runner = CliRunner()
     result = runner.invoke(run, ["--output=json", "properties", "get", "table", "default.my_table", "doesnotexist"])
     assert result.exit_code == 1
-    assert (
-        result.output
-        == """{"type": "NoSuchPropertyException", "message": "Could not find property doesnotexist on table default.my_table"}\n"""
+    assert result.output == (
+        '{"type": "NoSuchPropertyException", "message": "Could not find property doesnotexist on table default.my_table"}\n'
     )
 
 
@@ -967,3 +1061,82 @@ def test_json_properties_remove_table_does_not_exist(catalog: InMemoryCatalog) -
     result = runner.invoke(run, ["--output=json", "properties", "remove", "table", "default.doesnotexist", "location"])
     assert result.exit_code == 1
     assert result.output == """{"type": "NoSuchTableError", "message": "Table does not exist: default.doesnotexist"}\n"""
+
+
+def test_log_level_cli_option(mocker: MockFixture) -> None:
+    mock_basicConfig = mocker.patch("logging.basicConfig")
+
+    runner = CliRunner()
+    runner.invoke(run, ["--log-level", "DEBUG", "list"])
+
+    # Verify logging.basicConfig was called with DEBUG level
+    import logging
+
+    mock_basicConfig.assert_called_once()
+    call_kwargs = mock_basicConfig.call_args[1]
+    assert call_kwargs["level"] == logging.DEBUG
+
+
+def test_log_level_env_variable(mocker: MockFixture) -> None:
+    mock_basicConfig = mocker.patch("logging.basicConfig")
+    mocker.patch.dict(os.environ, {"PYICEBERG_LOG_LEVEL": "INFO"})
+
+    runner = CliRunner()
+    runner.invoke(run, ["list"])
+
+    # Verify logging.basicConfig was called with INFO level
+    import logging
+
+    mock_basicConfig.assert_called_once()
+    call_kwargs = mock_basicConfig.call_args[1]
+    assert call_kwargs["level"] == logging.INFO
+
+
+def test_log_level_default_warning(mocker: MockFixture) -> None:
+    mock_basicConfig = mocker.patch("logging.basicConfig")
+    # Ensure PYICEBERG_LOG_LEVEL is not set
+    mocker.patch.dict(os.environ, {}, clear=False)
+    if "PYICEBERG_LOG_LEVEL" in os.environ:
+        del os.environ["PYICEBERG_LOG_LEVEL"]
+
+    runner = CliRunner()
+    runner.invoke(run, ["list"])
+
+    # Verify logging.basicConfig was called with WARNING level (default)
+    import logging
+
+    mock_basicConfig.assert_called_once()
+    call_kwargs = mock_basicConfig.call_args[1]
+    assert call_kwargs["level"] == logging.WARNING
+
+
+def test_log_level_cli_overrides_env(mocker: MockFixture) -> None:
+    mock_basicConfig = mocker.patch("logging.basicConfig")
+    mocker.patch.dict(os.environ, {"PYICEBERG_LOG_LEVEL": "INFO"})
+
+    runner = CliRunner()
+    runner.invoke(run, ["--log-level", "ERROR", "list"])
+
+    # Verify CLI option overrides environment variable
+    import logging
+
+    mock_basicConfig.assert_called_once()
+    call_kwargs = mock_basicConfig.call_args[1]
+    assert call_kwargs["level"] == logging.ERROR
+
+
+def test_warehouse_cli_option_forwarded_to_catalog(mocker: MockFixture) -> None:
+    mock_basicConfig = mocker.patch("logging.basicConfig")
+    mock_catalog = MagicMock(spec=InMemoryCatalog)
+    mock_catalog.list_tables.return_value = []
+    mock_catalog.list_namespaces.return_value = []
+    mock_load_catalog = mocker.patch("pyiceberg.cli.console.load_catalog", return_value=mock_catalog)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        run, ["--catalog", "rest", "--uri", "https://catalog.service", "--warehouse", "example-warehouse", "list"]
+    )
+
+    assert result.exit_code == 0
+    mock_basicConfig.assert_called_once()
+    mock_load_catalog.assert_called_once_with("rest", uri="https://catalog.service", warehouse="example-warehouse")

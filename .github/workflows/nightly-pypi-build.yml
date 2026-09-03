@@ -24,33 +24,40 @@ on:
     - cron: "0 0 * * *"  # Runs at midnight UTC every day
   workflow_dispatch:  # Allows manual triggering
 
+permissions:
+  contents: read
+
 jobs:
   set-version:
-    if: github.repository == 'apache/iceberg-python'  # Only run for apache repo
+    if: github.repository == 'apache/iceberg-python' || github.event_name == 'workflow_dispatch' # Run on schedule for apache repo, or on manual dispatch from any repo
     runs-on: ubuntu-latest
     outputs:
       VERSION: ${{ steps.set-version.outputs.VERSION }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          persist-credentials: false
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: 3.12
 
-      - name: Install Poetry
-        run: make install-poetry
+      - name: Install UV
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
 
       - name: Set version
         id: set-version
         run: |
-          CURRENT_VERSION=$(poetry version --short)
+          CURRENT_VERSION=$(uv version --short)
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
           echo "VERSION=${CURRENT_VERSION}.dev${TIMESTAMP}" >> "$GITHUB_OUTPUT"
 
       - name: Debug version
-        run: echo "Publishing version ${{ steps.set-version.outputs.VERSION }}"
+        run: echo "Publishing version ${STEPS_SET_VERSION_OUTPUTS_VERSION}"
+        shell: bash
+        env:
+          STEPS_SET_VERSION_OUTPUTS_VERSION: ${{ steps.set-version.outputs.VERSION }}
 
   nightly-build:
     needs: set-version
@@ -59,6 +66,7 @@ jobs:
       version: ${{ needs.set-version.outputs.VERSION }}
   testpypi-publish:
     name: Publish to TestPypi
+    if: github.repository == 'apache/iceberg-python' # Only run for apache repo
     needs:
       - nightly-build
     runs-on: ubuntu-latest
@@ -71,15 +79,42 @@ jobs:
 
     steps:
     - name: Download all the artifacts
-      uses: actions/download-artifact@v5
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         merge-multiple: true
         path: dist/
     - name: List downloaded artifacts
       run: ls -R dist/
     - name: Publish to TestPyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
+      id: publish-testpypi
+      continue-on-error: true
+      uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
       with:
         repository-url: https://test.pypi.org/legacy/
         skip-existing: true
         verbose: true
+    - name: Display error message on publish failure
+      if: steps.publish-testpypi.outcome == 'failure'
+      run: |
+        echo "::error::Failed to publish to TestPyPI"
+        echo ""
+        echo "⚠️  TestPyPI Publish Failed"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo "This may be due to TestPyPI storage limits."
+        echo "See: https://docs.pypi.org/project-management/storage-limits"
+        echo ""
+        echo "To resolve this issue, use the pypi-cleanup utility to clean up old TestPyPI artifacts:"
+        echo "https://pypi.org/project/pypi-cleanup/"
+        echo ""
+        echo "  uvx pypi-cleanup --package pyiceberg --host https://test.pypi.org/ \\"
+        echo "    --verbose -d 10 --do-it --username <username>"
+        echo ""
+        echo "Requirements:"
+        echo "  • Must be a maintainer for pyiceberg on TestPyPI"
+        echo "    (https://test.pypi.org/project/pyiceberg)"
+        echo "  • Requires TestPyPI password and 2FA"
+        echo "  • ⚠️  ONLY do this for TestPyPI, NOT for production PyPI!"
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        exit 1

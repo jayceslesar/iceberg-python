@@ -69,7 +69,7 @@ from pyiceberg.expressions.literals import (
 from pyiceberg.typedef import L
 from pyiceberg.types import strtobool
 
-ParserElement.enablePackrat()
+ParserElement.enable_packrat()
 
 AND = CaselessKeyword("and")
 OR = CaselessKeyword("or")
@@ -82,7 +82,7 @@ LIKE = CaselessKeyword("like")
 BETWEEN = CaselessKeyword("between")
 
 unquoted_identifier = Word(alphas + "_", alphanums + "_$")
-quoted_identifier = QuotedString('"', escChar="\\", unquoteResults=True)
+quoted_identifier = QuotedString('"', esc_quote="\\", unquote_results=True)
 
 
 @quoted_identifier.set_parse_action
@@ -103,11 +103,10 @@ def _(result: ParseResults) -> Reference:
     return Reference(".".join(result.column))
 
 
-boolean = one_of(["true", "false"], caseless=True).set_results_name("boolean")
+boolean = one_of(["true", "false"], caseless=True)
 string = sgl_quoted_string.set_results_name("raw_quoted_string")
 decimal = common.real().set_results_name("decimal")
 integer = common.signed_integer().set_results_name("integer")
-number = common.number().set_results_name("number")
 literal = Group(string | decimal | integer | boolean).set_results_name("literal")
 literal_set = Group(
     DelimitedList(string) | DelimitedList(decimal) | DelimitedList(integer) | DelimitedList(boolean)
@@ -116,7 +115,7 @@ literal_set = Group(
 
 @boolean.set_parse_action
 def _(result: ParseResults) -> Literal[bool]:
-    if strtobool(result.boolean):
+    if strtobool(result[0]):
         return BooleanLiteral(True)
     else:
         return BooleanLiteral(False)
@@ -151,7 +150,7 @@ comparison_op = one_of(["<", "<=", ">", ">=", "=", "==", "!=", "<>"], caseless=T
 left_ref = column + comparison_op + literal
 right_ref = literal + comparison_op + column
 comparison = left_ref | right_ref
-between = column + BETWEEN + number + AND + number
+between = column + BETWEEN + literal + AND + literal
 
 
 @between.set_parse_action
