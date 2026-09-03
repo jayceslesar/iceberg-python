@@ -1527,6 +1527,28 @@ def cleanup_old_snapshots(table_name: str, snapshot_ids: list[int]):
 cleanup_old_snapshots("analytics.user_events", [12345, 67890, 11111])
 ```
 
+### Remove Orphaned Files
+
+Files under the table location that are not referenced by any snapshot, manifest, manifest list, metadata file or statistics file are considered orphaned. They can be left behind, for example, when a write fails after the data files were written but before they were committed. Remove them to reclaim storage:
+
+```python
+from datetime import timedelta
+
+# Report the orphaned files without removing anything
+result = table.maintenance.remove_orphaned_files(dry_run=True)
+print(result.orphaned_files)
+
+# Remove orphaned files that were last modified more than three days ago (the default)
+result = table.maintenance.remove_orphaned_files()
+print(f"Removed {len(result.deleted_files)} files, failed to remove {len(result.failed_deletions)} files")
+
+# Use a different retention period
+table.maintenance.remove_orphaned_files(older_than=timedelta(days=7))
+```
+
+!!! warning "Concurrent writes"
+    Files of a write that is in progress are not referenced by the table yet. Keep `older_than` longer than the time a write can take, otherwise the files of an in-flight write may be removed before they are committed. Run with `dry_run=True` first to review which files would be removed.
+
 ## Views
 
 If PyIceberg is unable to automatically determine view support on your REST Catalog, you can manually specify, `"view-endpoints-supported": "true"`:

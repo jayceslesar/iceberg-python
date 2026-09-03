@@ -16,13 +16,16 @@
 # under the License.
 import uuid
 from collections.abc import Generator
+from datetime import timedelta
 
 import pyarrow as pa
 import pytest
 from pytest_lazy_fixtures import lf
 
-from pyiceberg.catalog import Catalog
+from pyiceberg.catalog import Catalog, load_catalog
+from pyiceberg.io import PY_IO_IMPL
 from pyiceberg.table import Table
+from pyiceberg.table.maintenance import RemoveOrphansResult
 from pyiceberg.table.refs import SnapshotRef
 
 
@@ -332,3 +335,43 @@ def test_rollback_to_timestamp_chained_with_tag(table_with_snapshots: Table) -> 
     assert table_with_snapshots.metadata.refs[tag_name] == SnapshotRef(
         snapshot_id=current_snapshot.snapshot_id, snapshot_ref_type="tag"
     )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("io_impl", ["pyiceberg.io.pyarrow.PyArrowFileIO", "pyiceberg.io.fsspec.FsspecFileIO"])
+def test_remove_orphaned_files(table_with_snapshots: Table, io_impl: str) -> None:
+    catalog = load_catalog(
+        "local",
+        **{
+            "type": "rest",
+            "uri": "http://localhost:8181",
+            "s3.endpoint": "http://localhost:9000",
+            "s3.access-key-id": "admin",
+            "s3.secret-access-key": "password",
+            PY_IO_IMPL: io_impl,
+        },
+    )
+    tbl = catalog.load_table(table_with_snapshots.name())
+    rows = tbl.scan().to_arrow()
+    assert rows.num_rows == 4
+
+    orphan = f"{tbl.location()}/data/orphan.parquet"
+    with tbl.io.new_output(orphan).create() as f:
+        f.write(b"orphan")
+    assert tbl.io.new_input(orphan).exists()
+
+    dry_run = tbl.maintenance.remove_orphaned_files(older_than=timedelta(0), dry_run=True)
+    assert dry_run == RemoveOrphansResult(orphaned_files={orphan})
+    assert tbl.io.new_input(orphan).exists()
+
+    result = tbl.maintenance.remove_orphaned_files(older_than=timedelta(0))
+    assert result == RemoveOrphansResult(orphaned_files={orphan}, deleted_files={orphan})
+    assert not tbl.io.new_input(orphan).exists()
+
+    assert tbl.maintenance.remove_orphaned_files(older_than=timedelta(0)) == RemoveOrphansResult()
+    all_known_files = tbl.inspect._all_known_files()
+    assert all_known_files["data_files"]
+    for files in all_known_files.values():
+        for file in files:
+            assert tbl.io.new_input(file).exists(), f"Known file {file} was removed"
+    assert tbl.scan().to_arrow() == rows
